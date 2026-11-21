@@ -1,0 +1,11 @@
+{
+  "appId": "com.kizarov3.cdplayer",
+  "appName": "CDPlayer",
+  "webDir": "dist-android/www",
+  "android": {
+    "minWebViewVersion": 105
+  },
+  "server": {
+    "errorPath": "old-webview.html"
+  }
+}

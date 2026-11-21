@@ -1,0 +1,278 @@
+// Spotify discs: the Web Playback SDK's one player for the app (SpotifySession), and a stand-in <audio> element per
+// track (SpotifyTrackElement) that AudioEngine drives as a deck — so the transport, the disc, the seek bar, lyrics
+// and karaoke don't need to know the sound comes from Spotify. The SDK plays through Widevine, outside Web Audio:
+// no EQ, mono, crossfade or visualizer for it.
+
+let sdk = null;
+/** Loads Spotify's player script once, on first use (never at startup — the player must work offline). */
+export function loadSpotifySdk(doc = document, win = window) {
+  if (sdk) return sdk;
+  sdk = new Promise((resolve, reject) => {
+    if (win.Spotify && win.Spotify.Player) { resolve(win.Spotify.Player); return; }
+    win.onSpotifyWebPlaybackSDKReady = () => resolve(win.Spotify.Player);
+    const script = doc.createElement('script');
+    script.src = 'https://sdk.scdn.co/spotify-player.js';
+    script.onerror = () => { sdk = null; script.remove(); reject(new Error('sdk')); };
+    doc.head.append(script);
+  });
+  return sdk;
+}
+
+export const isSpotifyUri = (p) => typeof p === 'string' && /^spotify:track:[A-Za-z0-9]+$/.test(p);
+
+/**
+ * What Spotify is handed after the current track: the rest of the disc (up to `end`, the disc's end in the changer, or
+ * the first track that isn't Spotify's), so an album plays on without a gap. Not when shuffling (CDPlayer picks each
+ * next song itself, and there's no gap to keep between unrelated songs) or repeating a track or a disc — then just
+ * the song, and CDPlayer says what comes next when it ends.
+ */
+export function spotifyUpcoming(queue, index, { shuffle, repeat }, end = queue.length) {
+  if (shuffle !== 'OFF' || repeat === 'TRACK' || repeat === 'DISC' || index < 0) return [];
+  const out = [];
+  for (let i = index + 1; i < Math.min(end, queue.length) && isSpotifyUri(queue[i]); i++) out.push(queue[i]);
+  return out;
+}
+
+const NEAR_END_MS = 2000;   // a track paused back at 0 this close to its end has finished
+const OVERRUN_MS = 1500;    // no word from Spotify this long past the end: finished anyway
+const STALE_MS = 3000;      // after a request, an unknown track this far from where it was asked for is still the old one
+
+export class SpotifySession {
+  // `log(text)`: each step of connecting and playing, for the Spotify log (what went wrong where, on a PC we can't see).
+  constructor({ loadPlayer, getToken, startPlayback, drmReady = null, now = () => Date.now(), wait = (ms) => new Promise((r) => setTimeout(r, ms)), volume = 1, name = 'CDPlayer', connectTimeoutMs = 15000, log = () => {} }) {
+    Object.assign(this, { loadPlayer, getToken, startPlayback, drmReady, now, wait, volume, name, connectTimeoutMs, log });
+    this.listeners = new Set();
+    this.player = null; this.deviceId = null; this.ready = null;
+    this.currentUri = null; this.lost = false;
+    this.sent = []; this.sentIndex = 0; this.awaiting = null; this.aliases = new Map(); this.pendingUpcoming = null;
+    this.pos = { ms: 0, at: now(), paused: true }; this.durationMs = 0;
+    this.everPlayed = false; this.playbackErrors = 0; this.saidUnsupported = false;
+  }
+  on(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
+  emit(e) { for (const fn of [...this.listeners]) fn(e); }
+
+  connect() {
+    if (this.ready) return this.ready;
+    this.ready = (async () => {
+      if (!this.player) {
+        // Widevine comes down on first run; without it the SDK can only fail, so say so rather than try.
+        const drm = this.drmReady ? await this.drmReady().catch(() => false) : true;
+        this.log(`widevine ${drm ? 'ready' : 'NOT ready'}`);
+        if (!drm) { this.emit({ type: 'error', reason: 'unsupported' }); return { ok: false, reason: 'unsupported' }; }
+        let Player;
+        try { Player = await this.loadPlayer(); } catch (e) { Player = null; this.log(`player script failed to load${e && e.message ? `: ${e.message}` : ''}`); }
+        if (!Player) { this.emit({ type: 'error', reason: 'sdk' }); return { ok: false, reason: 'sdk' }; }
+        this.log('player script loaded');
+        this.createPlayer(Player);
+      }
+      return new Promise((resolve) => {
+        this.settle = resolve;
+        // A player that never says ready (no network, Spotify not registering it) mustn't leave PLAY waiting forever.
+        this.connectTimer = setTimeout(() => { this.log(`player not ready after ${this.connectTimeoutMs / 1000} s`); this.fail('notready'); }, this.connectTimeoutMs);
+        this.log('connecting the player');
+        this.player.connect().then((ok) => { this.log(`player.connect() → ${ok}`); if (!ok) this.fail('unsupported'); }, (e) => { this.log(`player.connect() threw ${e && e.message}`); this.fail('unsupported'); });
+      });
+    })();
+    this.ready.then((r) => { if (!r.ok) this.ready = null; }); // a failed connection can be tried again
+    return this.ready;
+  }
+  // One SDK player for the app's whole run: a second one in the same page never registers with Spotify, so
+  // disconnecting closes this one and connecting again reopens it.
+  createPlayer(Player) {
+    const player = this.player = new Player({ name: this.name, volume: this.volume, getOAuthToken: (cb) => this.giveToken(cb) });
+    const said = (e) => (e && e.message ? `: ${e.message}` : '');
+    player.addListener('ready', ({ device_id }) => { this.log('player ready'); this.deviceId = device_id; this.resolveConnect({ ok: true }); });
+    player.addListener('not_ready', () => { this.log('player not_ready'); this.deviceId = null; });
+    player.addListener('initialization_error', (e) => { this.log(`initialization_error${said(e)}`); this.fail('unsupported'); });
+    // Spotify refuses the empty token we had to give while offline: that's the network, not a sign-out.
+    player.addListener('authentication_error', (e) => { this.log(`authentication_error${said(e)} (token: ${this.tokenError || 'ok'})`); if (this.tokenError === 'OFFLINE') this.fail('offline', this.tokenDetail); else this.fail('auth'); });
+    player.addListener('account_error', (e) => { this.log(`account_error${said(e)}`); this.fail('premium'); });
+    player.addListener('playback_error', (e) => { this.log(`playback_error${said(e)}`); this.onPlaybackError(); });
+    player.addListener('player_state_changed', (s) => this.onState(s));
+  }
+  /** The token for the SDK: { token } or { error } from the main process (a plain string is accepted too). */
+  giveToken(cb) {
+    this.getToken().then((t) => {
+      const token = typeof t === 'string' ? t : t && t.token;
+      this.tokenError = token ? null : (t && t.error) || 'SIGN_IN';
+      this.tokenDetail = (!token && t && t.detail) || null;
+      cb(token || '');
+    }, () => { this.tokenError = 'OFFLINE'; this.tokenDetail = null; cb(''); });
+  }
+  resolveConnect(result) { clearTimeout(this.connectTimer); const settle = this.settle; this.settle = null; if (settle) settle(result); }
+  fail(reason, detail = null) { this.emit(detail ? { type: 'error', reason, detail } : { type: 'error', reason }); this.resolveConnect({ ok: false, reason }); }
+  /** DISCONNECT SPOTIFY: stops the music and closes the player (kept, to be reopened by the next connect). */
+  disconnect() {
+    if (this.currentUri && !this.pos.paused) this.pause();
+    this.currentUri = null; this.awaiting = null; this.sent = []; this.pendingUpcoming = null; this.lost = false;
+    this.deviceId = null; this.ready = null;
+    if (this.player) this.player.disconnect();
+  }
+
+  get paused() { return this.pos.paused; }
+  position() {
+    const p = this.pos.paused ? this.pos.ms : this.pos.ms + (this.now() - this.pos.at);
+    return this.durationMs ? Math.min(p, this.durationMs + OVERRUN_MS * 2) : p;
+  }
+
+  /** Plays `uri` from `positionMs`, followed by `upcoming`. False when Spotify refused (the error is emitted). */
+  async play(uri, positionMs = 0, upcoming = []) {
+    // Requests overlap (quick skips, shuffle toggles): only the newest one's answer counts.
+    const gen = this.gen = (this.gen || 0) + 1;
+    const c = await this.connect();
+    if (gen !== this.gen) return false;
+    if (!c.ok) return false;
+    this.previousUri = this.currentUri; this.requestedMs = positionMs;
+    this.sent = [uri, ...upcoming]; this.sentIndex = 0;
+    for (const [raw, meant] of this.aliases) if (!this.sent.includes(meant)) this.aliases.delete(raw); // copies still in play stay known
+    this.currentUri = uri; this.awaiting = uri; this.pendingUpcoming = null; this.lost = false;
+    this.pos = { ms: positionMs, at: this.now(), paused: false };
+    const request = { deviceId: this.deviceId, uris: this.sent, positionMs: Math.round(positionMs) };
+    let r = await this.startPlayback(request);
+    this.log(`play ${this.sent.length} track(s) → ${r.ok ? 'ok' : `status ${r.status}${r.reason ? ` ${r.reason}` : ''}${r.detail ? ` ${r.detail}` : ''}`}`);
+    if (gen !== this.gen) return false;
+    if (!r.ok && r.status === 404) {
+      await this.wait(1000);
+      if (gen !== this.gen) return false;
+      r = await this.startPlayback({ ...request, deviceId: this.deviceId });
+      if (gen !== this.gen) return false;
+    }
+    if (r.ok) return true;
+    // Refused: nothing is on the device, so Spotify's empty report next isn't another device taking over.
+    this.currentUri = null; this.awaiting = null;
+    this.pos = { ms: positionMs, at: this.now(), paused: true };
+    // A 403 is only a missing Premium when Spotify says so; "Restriction violated" is a track it won't play.
+    const premium = r.status === 403 && r.reason === 'PREMIUM_REQUIRED';
+    const reason = r.status === 401 ? 'auth' : premium ? 'premium' : r.status === 0 ? 'offline' : 'playback';
+    this.emit(reason === 'offline' && r.detail ? { type: 'error', reason, detail: r.detail } : { type: 'error', reason });
+    return false;
+  }
+  async resume() {
+    if (this.pendingUpcoming) return this.play(this.currentUri, this.position(), this.pendingUpcoming);
+    this.pos = { ms: this.pos.ms, at: this.now(), paused: false };
+    if (this.player) await this.player.resume();
+    return true;
+  }
+  pause() {
+    this.pos = { ms: this.position(), at: this.now(), paused: true };
+    if (this.player) this.player.pause();
+  }
+  seek(ms) {
+    this.pos = { ms, at: this.now(), paused: this.pos.paused };
+    if (this.player) this.player.seek(ms);
+  }
+  setVolume(v) { this.volume = v; if (this.player) this.player.setVolume(v); }
+
+  /** The order after the current track changed (shuffle, repeat, the queue): Spotify is re-told only if it differs. */
+  resync(upcoming) {
+    if (!this.currentUri || this.lost) return;
+    const tail = this.sent.slice(this.sentIndex + 1);
+    if (tail.length === upcoming.length && tail.every((u, i) => u === upcoming[i])) { this.pendingUpcoming = null; return; }
+    if (this.pos.paused) { this.pendingUpcoming = upcoming; return; }
+    this.play(this.currentUri, this.position(), upcoming);
+  }
+  /** Called on the playback timer: a track that ran out without a report from Spotify has finished. */
+  tick() {
+    if (!this.currentUri || this.pos.paused || !this.durationMs || this.lost) return;
+    if (this.position() >= this.durationMs + OVERRUN_MS) this.finish(this.currentUri);
+  }
+  finish(uri) {
+    // Nothing is on Spotify's device now: playing this track again (repeat one) is a fresh request, not a resume.
+    this.currentUri = null;
+    this.pos = { ms: 0, at: this.now(), paused: true };
+    this.emit({ type: 'finished', uri });
+  }
+
+  onPlaybackError() {
+    this.playbackErrors++;
+    if (!this.everPlayed && this.playbackErrors >= 2) {
+      if (!this.saidUnsupported) { this.saidUnsupported = true; this.emit({ type: 'error', reason: 'unsupported' }); }
+      return;
+    }
+    this.emit({ type: 'error', reason: 'playback' });
+  }
+
+  onState(s) {
+    if (!s) {
+      if (this.currentUri && !this.lost) {
+        this.lost = true;
+        this.pos = { ms: this.position(), at: this.now(), paused: true };
+        this.emit({ type: 'lost', uri: this.currentUri });
+      }
+      return;
+    }
+    const track = s.track_window && s.track_window.current_track;
+    if (!track) return;
+    const before = this.position();
+    const raw = track.uri, linked = track.linked_from && track.linked_from.uri;
+    let uri = this.aliases.get(raw) || (linked && this.sent.includes(linked) ? linked : raw);
+    if (this.awaiting) {
+      if (uri !== this.awaiting) {
+        // The previous track's last word, or another track of the list: not the one asked for.
+        const known = uri === this.previousUri || this.sent.includes(uri);
+        if (known || Math.abs(s.position - this.requestedMs) > STALE_MS) return;
+        this.aliases.set(raw, this.awaiting); uri = this.awaiting; // Spotify plays another copy of it (relinked)
+      }
+      this.awaiting = null;
+    } else if (uri !== this.currentUri && !this.sent.includes(uri) && this.sent[this.sentIndex + 1]) {
+      this.aliases.set(raw, this.sent[this.sentIndex + 1]); uri = this.sent[this.sentIndex + 1]; // the next one, relinked
+    }
+    this.lost = false;
+    if (uri !== this.currentUri) {
+      const from = this.currentUri, i = this.sent.indexOf(uri, this.sentIndex);
+      if (i >= 0) this.sentIndex = i;
+      this.currentUri = uri;
+      this.durationMs = s.duration;
+      this.pos = { ms: s.position, at: this.now(), paused: s.paused };
+      this.emit({ type: 'trackchange', from, to: uri });
+      return;
+    }
+    if (s.paused && s.position === 0 && this.durationMs > 0 && before >= this.durationMs - NEAR_END_MS) { this.finish(uri); return; }
+    if (s.position > 0 && !s.paused) this.everPlayed = true;
+    this.durationMs = s.duration;
+    this.pos = { ms: s.position, at: this.now(), paused: s.paused };
+  }
+}
+
+/** One track of a Spotify disc, looking enough like an <audio> element for AudioEngine to play it as a deck. */
+export class SpotifyTrackElement {
+  constructor(session, uri, durationMs, upcoming = () => []) {
+    Object.assign(this, { session, uri, durationMs, upcoming });
+    this.handlers = new Map();
+    this.pending = 0; this.ended = false; this.disposed = false;
+    this.off = session.on((e) => this.onSession(e));
+    setTimeout(() => this.fire('loadedmetadata'), 0); // the length is known from the disc already
+  }
+  addEventListener(type, fn) { if (!this.handlers.has(type)) this.handlers.set(type, new Set()); this.handlers.get(type).add(fn); }
+  removeEventListener(type, fn) { const set = this.handlers.get(type); if (set) set.delete(fn); }
+  fire(type) { if (!this.disposed) for (const fn of [...(this.handlers.get(type) || [])]) fn(); }
+
+  /** Spotify is on this track (not finished, not taken over by another device). */
+  get own() { return !this.ended && !this.disposed && this.session.currentUri === this.uri && !this.session.lost; }
+  get paused() { return !this.own || this.session.paused; }
+  get duration() { return this.durationMs / 1000; }
+  get currentTime() { return this.own ? Math.min(this.durationMs, this.session.position()) / 1000 : this.pending; }
+  set currentTime(seconds) {
+    if (this.own) this.session.seek(Math.round(seconds * 1000));
+    else { this.pending = seconds; this.ended = false; }
+  }
+  async play() {
+    if (this.own) { if (this.session.paused) await this.session.resume(); return; }
+    this.ended = false;
+    const ok = await this.session.play(this.uri, Math.round(this.pending * 1000), this.upcoming());
+    if (!ok) throw new Error('spotify');
+  }
+  pause() { if (this.own && !this.session.paused) { this.session.pause(); this.pending = this.currentTime; } }
+  onSession(e) {
+    if ((e.type === 'trackchange' && e.from === this.uri) || (e.type === 'finished' && e.uri === this.uri)) {
+      this.pending = 0; this.ended = true; this.fire('ended');
+    } else if (e.type === 'lost' && e.uri === this.uri) this.pending = this.session.pos.ms / 1000;
+  }
+  removeAttribute() {}
+  load() {
+    if (this.disposed) return;
+    if (this.own && !this.session.paused) this.session.pause();
+    this.disposed = true;
+    this.off();
+  }
+}

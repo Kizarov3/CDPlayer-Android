@@ -1,0 +1,141 @@
+'use strict';
+/**
+ * Themes people make (Settings → THEME → + NEW THEME): six colors, a scene and maybe a background image. Each is kept
+ * as one file in the data folder's themes/, in the same .cdtheme format it's shared in — or, without its image, as a
+ * short "cdtheme:…" code to paste in a chat. Nothing read from a file or a code is used before parseTheme has checked it.
+ */
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const store = require('./store');
+
+const BUILTIN = ['RED', 'BLUE', 'SUNSET', 'FOREST', 'GALAXY', 'OCEAN', 'MATRIX', 'AUTUMN', 'SNOW', 'WHITE', 'AUTO'];
+const SCENES = ['BARS', 'SNOW', 'GALAXY', 'OCEAN', 'MATRIX', 'AUTUMN', 'FOREST']; // (a new one at the end: older codes keep their numbers)
+const COLOR_KEYS = ['bg', 'card', 'accent', 'accent2', 'text', 'muted'];
+const MAX_IMAGE = 1.5 * 1024 * 1024;
+const IMAGE_URL = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/;
+const clamp = (v, lo, hi, d) => (Number.isFinite(v) ? Math.max(lo, Math.min(hi, Math.round(v))) : d);
+
+function cleanName(name) {
+  if (typeof name !== 'string') return null;
+  const n = name.trim().toUpperCase().slice(0, 16).trim();
+  return n && !/[\\/:*?"<>|\u0000-\u001f\u007f]/.test(n) ? n : null;
+}
+
+/** A theme as read from a file or a code → the theme, cleaned up, or null if it isn't one. */
+function parseTheme(json) {
+  if (!json || typeof json !== 'object' || json.cdtheme !== 1) return null;
+  const name = cleanName(json.name);
+  if (!name || !json.colors || typeof json.colors !== 'object') return null;
+  const colors = {};
+  for (const k of COLOR_KEYS) {
+    const c = json.colors[k];
+    if (!Array.isArray(c) || c.length !== 3 || !c.every((v) => Number.isInteger(v) && v >= 0 && v <= 255)) return null;
+    colors[k] = [...c];
+  }
+  const scene = json.scene == null ? 'BARS' : json.scene;
+  if (!SCENES.includes(scene)) return null;
+  const image = json.image == null ? null : json.image;
+  if (image !== null && (typeof image !== 'string' || image.length > MAX_IMAGE || !IMAGE_URL.test(image))) return null;
+  return { cdtheme: 1, name, colors, scene, image, blur: clamp(json.blur, 0, 40, 0), dim: clamp(json.dim, 0, 90, 30) };
+}
+
+/** `name`, or "NAME 2", "NAME 3"… if a built-in theme or one of `taken` already has it (still 16 characters at most). */
+function uniqueName(name, taken) {
+  const used = new Set([...BUILTIN, ...taken]);
+  if (!used.has(name)) return name;
+  for (let n = 2; ; n++) {
+    const suffix = ` ${n}`, candidate = `${name.slice(0, 16 - suffix.length).trimEnd()}${suffix}`;
+    if (!used.has(candidate)) return candidate;
+  }
+}
+
+// The code: version, scene, the 18 color values, the name's length and the name, and a checksum byte, as bytes in
+// base64url — about 50 characters. The length and the checksum turn a code changed on the way (a chat cutting it short,
+// a character added) into no theme rather than a wrong one.
+const CODE_PREFIX = 'cdtheme:';
+const checksum = (bytes) => bytes.reduce((sum, b) => (sum + b) & 255, 0);
+function encodeCode(theme) {
+  const t = parseTheme(theme);
+  if (!t || t.image) return null;
+  const name = Buffer.from(t.name, 'utf8');
+  const body = [1, SCENES.indexOf(t.scene), ...COLOR_KEYS.flatMap((k) => t.colors[k]), name.length, ...name];
+  return CODE_PREFIX + Buffer.from([...body, checksum(body)]).toString('base64url');
+}
+function decodeCode(text) {
+  if (typeof text !== 'string') return null;
+  const s = text.replace(/\s+/g, '');
+  if (!s.toLowerCase().startsWith(CODE_PREFIX)) return null;
+  const encoded = s.slice(CODE_PREFIX.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(encoded)) return null;
+  const b = [...Buffer.from(encoded, 'base64url')];
+  if (b.length < 23 || b[0] !== 1 || b[1] >= SCENES.length || b.length !== 22 + b[20]) return null;
+  if (checksum(b.slice(0, -1)) !== b[b.length - 1]) return null;
+  const colors = Object.fromEntries(COLOR_KEYS.map((k, i) => [k, b.slice(2 + i * 3, 5 + i * 3)]));
+  return parseTheme({ cdtheme: 1, name: Buffer.from(b.slice(21, -1)).toString('utf8'), colors, scene: SCENES[b[1]] });
+}
+
+// ---- Where they're kept: <data dir>/themes/, a file per theme named after a hash of its name ----------------------
+
+const MAX_FILE = 4 * 1024 * 1024;
+const themesDir = () => path.join(store.dataDir(), 'themes');
+const fileFor = (name) => path.join(themesDir(), `${crypto.createHash('sha1').update(name).digest('hex').slice(0, 16)}.cdtheme`);
+
+function readThemeFile(p) {
+  try {
+    if (fs.statSync(p).size > MAX_FILE) return null;
+    return parseTheme(JSON.parse(fs.readFileSync(p, 'utf8')));
+  } catch { return null; }
+}
+// Every theme kept, with the file it's in. Files that aren't themes are left out.
+function entries() {
+  let files;
+  try { files = fs.readdirSync(themesDir()).filter((f) => f.endsWith('.cdtheme')); } catch { return []; }
+  return files.map((f) => ({ file: path.join(themesDir(), f), theme: readThemeFile(path.join(themesDir(), f)) })).filter((e) => e.theme);
+}
+/** Every theme kept, by name. */
+function list() {
+  return entries().map((e) => e.theme).sort((a, b) => a.name.localeCompare(b.name));
+}
+/** Themes of your own kept under a name a built-in theme has taken since (WHITE, added with the light theme: one called WHITE before then
+ *  was hidden behind it) → kept again under a name of their own ("WHITE 2"). Returns { old name: new name }. */
+function freeBuiltinNames() {
+  const renamed = {};
+  for (const { file, theme } of entries()) {
+    if (!BUILTIN.includes(theme.name)) continue;
+    const kept = save(theme);
+    if (!kept) continue; // (couldn't be written: left as it was, to try again next time)
+    try { fs.unlinkSync(file); } catch { /* gone already */ }
+    renamed[theme.name] = kept.name;
+  }
+  return renamed;
+}
+/** Keeps a theme — a new one under a name nothing else has, or `oldName` edited (renamed: the old file goes). */
+function save(theme, oldName = null) {
+  const t = parseTheme(theme);
+  if (!t) return null;
+  t.name = uniqueName(t.name, list().map((x) => x.name).filter((n) => n !== oldName));
+  try {
+    fs.mkdirSync(themesDir(), { recursive: true });
+    const target = fileFor(t.name), tmp = `${target}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(t));
+    fs.renameSync(tmp, target);
+  } catch { return null; }
+  if (oldName && oldName !== t.name) remove(oldName);
+  return t;
+}
+function remove(name) {
+  try { fs.unlinkSync(fileFor(name)); return true; } catch { return false; }
+}
+/** A .cdtheme someone shared → kept (under a new name if needed), or null if it isn't one. */
+function importFile(p) {
+  const t = readThemeFile(p);
+  return t ? save(t) : null;
+}
+function exportFile(name, target) {
+  const t = list().find((x) => x.name === name);
+  if (!t) return false;
+  try { fs.writeFileSync(target, JSON.stringify(t, null, 1)); return true; } catch { return false; }
+}
+
+module.exports = { BUILTIN, SCENES, COLOR_KEYS, parseTheme, uniqueName, encodeCode, decodeCode, list, save, remove, importFile, exportFile, freeBuiltinNames };

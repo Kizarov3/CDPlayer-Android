@@ -1,0 +1,634 @@
+// The CD booklet. With the full-size album art open over the jewel case, clicking the art lifts the booklet out of the
+// case and opens it into a two-page spread: the front cover, the album's tracklist, the song's lyrics, the credits and
+// the back cover with its small print — printed in the album's own colours. ← / → or clicking a page turns it; Esc or
+// clicking outside puts it back in the case. Pages are HTML (real text), laid over the canvas-drawn case.
+// The shelf opens an album's booklet the same way (albumBooklet): its whole tracklist, every song's lyrics (found
+// online while it's open, slotting in without moving the page being read), and the album's credits.
+import { el, anim, smooth, pathFrames } from './widgets.js';
+import { deriveAutoTheme, rgb } from './theme.js';
+import { parseLrc, formatLyricsForDisplay, currentLineIndex } from './lyrics.js';
+import { paginate, leavesFor, ean13 } from './booklet-layout.js';
+import { albumCredits, albumSummary, albumSmallPrint, sameAlbum, ownerMarks, storyChunks, releasedLine, formatReleased, penHidden } from './booklet-content.js';
+import { hiddenName } from './hidden-track.js';
+import { withDiscHeads } from './box-set.js';
+import { t, locale } from './i18n.js';
+
+const LIFT_MS = 420, TURN_MS = 650;
+const layer = () => document.getElementById('overlays');
+let book = null; // the open booklet: { root, spread, leaves, turned, from, app, content, lyricsTimer, closing }
+
+export const isBookletOpen = () => !!book;
+const discHeading = (n) => t('DISC {n}', { n }); // (the tracklist's rows are `t` where it's used)
+const wait = (ms) => new Promise((r) => setTimeout(r, anim.enabled ? ms : 0));
+
+// ---- Opening, turning, closing ------------------------------------------------------------------------------------
+
+/**
+ * Opens a booklet rising out of `from` (the art's rectangle on screen): the current track's, or `content` (what
+ * albumBooklet() gives). `lid`: it's in a jewel case's lid, open on its hinge — { angle (its rotateY), perspective,
+ * origin {x, y} (the lid's, on screen), out() (it's left the lid), back() (it's in again) }: the booklet comes out of
+ * the lid's tabs first, the way it's taken out of a real case, and goes back into them shut.
+ */
+export async function openBooklet(app, from, content = null, lid = null) {
+  if (book || (!content && !app.state.details)) return;
+  content = content || await songContent(app);
+  const size = pageSize();
+  const root = el('div', { class: 'booklet-layer' });
+  const spread = el('div', { class: 'booklet' });
+  Object.assign(spread.style, {
+    width: `${size * 2}px`, height: `${size}px`,
+    left: `${onPhone() ? 8 - size : Math.round((window.innerWidth - size * 2) / 2)}px`, top: `${Math.round((window.innerHeight - size) / 2)}px`, // (a phone: the cover, on the right, in view)
+  });
+  spread.style.setProperty('--page', `${size}px`);
+  applyColors(spread, content.cover, !!lid);
+  root.append(spread);
+  layer().append(root);
+
+  // Under it: back and forward, which spread this is, and closing — the clicks and keys, said and to hand.
+  const where = el('span', { class: 'booklet-where' });
+  const back = el('button', { class: 'pill', title: t('Back a page (←)'), onClick: () => step(-1) }, '‹');
+  const forward = el('button', { class: 'pill', title: t('Next page (→)'), onClick: () => step(1) }, '›');
+  const bar = el('div', { class: 'booklet-bar' }, back, where, forward,
+    el('button', { class: 'pill', title: t('Put the booklet back (Esc)'), onClick: () => closeBooklet() }, t('CLOSE')));
+  bar.style.top = `${Math.round((window.innerHeight + size) / 2) + 12}px`;
+  root.append(bar);
+  book = { root, spread, leaves: [], turned: 0, side: 'right', from, app, content, where, back, forward, lid, openedAt: performance.now() };
+  buildLeaves();
+  stack();
+
+  // Clicks: the right page turns forward, the left page back, anything outside the booklet closes it.
+  root.addEventListener('mousedown', (e) => { if (e.target === root) closeBooklet(); });
+  // (a phone: a swipe turns too — left on, right back — a page of songs being all rows, each a tap that plays)
+  let swipe = null;
+  spread.addEventListener('touchstart', (e) => { swipe = onPhone() && e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY, done: false } : null; }, { passive: true });
+  spread.addEventListener('touchend', (e) => {
+    if (!swipe || !e.changedTouches.length) return;
+    const dx = e.changedTouches[0].clientX - swipe.x, dy = e.changedTouches[0].clientY - swipe.y;
+    if (Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy) * 1.5) { swipe.done = true; step(dx < 0 ? 1 : -1); }
+  });
+  spread.addEventListener('click', (e) => {
+    if (swipe && swipe.done) { swipe = null; e.stopPropagation(); return; } // (the swipe's own tap)
+    if (e.target.closest('[data-play], [data-link]')) return;
+    const r = spread.getBoundingClientRect();
+    if (onPhone()) step(e.clientX >= window.innerWidth / 2 ? 1 : -1); // (the page in view: its right half on, its left back)
+    else if (e.clientX >= r.left + r.width / 2) turn(1); else turn(-1);
+  });
+  window.addEventListener('keydown', onKey, true);
+  startLyricsHighlight(app);
+  if (content.start) content.start();
+
+  // Rise out of the case: start as the art (the cover sits in the right half), grow to the middle, then open.
+  const target = spread.getBoundingClientRect();
+  if (from && lid && anim.enabled) {
+    // Out of the lid: lying in it (the lid open on its hinge), slid out from under its tabs, turned to face you as it
+    // comes to the middle — shut — and then opened.
+    root.classList.add('entering');
+    lidView(root, lid);
+    spread.style.transformOrigin = `${size}px 0`;
+    const path = lidPath(from, target, size, lid);
+    const a = spread.animate(pathFrames((u) => ({ transform: path.at(u) }), 60), { duration: LID_MS, easing: 'linear', fill: 'backwards' });
+    spread.classList.add('in-lid');
+    setTimeout(() => { if (lid.out) lid.out(); }, LID_MS * 0.04);
+    setTimeout(() => spread.classList.remove('in-lid'), LID_MS * path.faced);
+    setTimeout(() => root.classList.remove('entering'), LID_MS * 0.3);
+    await a.finished.catch(() => {});
+    root.style.perspective = ''; root.style.perspectiveOrigin = '';
+  } else if (from && anim.enabled) {
+    const k = from.width / size;
+    spread.style.transformOrigin = `${size}px 0`;
+    spread.style.transform = `translate(${from.left - (target.left + size)}px, ${from.top - target.top}px) scale(${k})`;
+    root.classList.add('entering');
+    void spread.offsetWidth;
+    spread.style.transition = `transform ${LIFT_MS}ms cubic-bezier(.2,.7,.2,1)`;
+    root.classList.remove('entering');
+    spread.style.transform = 'none';
+  }
+  else await wait(LIFT_MS);
+  if (lid && !(from && anim.enabled) && lid.out) lid.out();
+  if (book && book.spread === spread && book.turned === 0) step(1);
+}
+
+const LID_MS = 950, LID_BACK_MS = 720; // (put away quicker than it's taken out)
+// Seen as the case is: the same perspective as its lid's.
+function lidView(root, lid) {
+  root.style.perspective = `${lid.perspective}px`;
+  root.style.perspectiveOrigin = `${lid.origin.x}px ${lid.origin.y}px`;
+}
+// The shut booklet's way out of the lid to the middle, as one movement: lying in the open lid (its front cover on
+// `from`, seen from behind), slid out from under the tabs and lifted off, turned round to face you as it's brought to
+// the middle. → { at(u) (u 0 → 1: its transform), faced (the u at which it's turned past edge-on) }.
+function lidPath(from, target, size, lid) {
+  const k0 = from.width / size, x0 = from.left - (target.left + size), y0 = from.top - target.top;
+  const angle = (u) => lid.angle * (1 - smooth(0.18, 0.85, u));
+  const at = (u) => {
+    const move = smooth(0.25, 1, u), out = smooth(0, 0.32, u) * (1 - smooth(0.32, 1, u)), k = k0 + (1 - k0) * move;
+    // Turned round its middle once it's out of the tabs, not swung on its spine like a second door.
+    const p = (size / 2) * smooth(0.02, 0.3, u);
+    return `translate3d(${(x0 * (1 - move)).toFixed(1)}px, ${(y0 * (1 - move)).toFixed(1)}px, 0) scale3d(${k.toFixed(4)}, ${k.toFixed(4)}, ${k.toFixed(4)}) `
+      + `translate3d(${p.toFixed(1)}px, 0, 0) rotateY(${angle(u).toFixed(2)}deg) translate3d(${(-p - 0.5 * size * out).toFixed(1)}px, 0, ${(16 * out).toFixed(1)}px)`;
+  };
+  let faced = 1;
+  for (let u = 0; u <= 1; u += 0.005) if (Math.abs(angle(u)) < 90) { faced = u; break; }
+  return { at, faced };
+}
+
+function onKey(e) {
+  if (!book) return;
+  if (e.key === 'ArrowRight') { e.preventDefault(); e.stopPropagation(); step(1); } // (Space plays and pauses, as everywhere)
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); e.stopPropagation(); step(-1); }
+}
+
+function turn(direction) {
+  if (!book || book.closing) return;
+  const { leaves } = book;
+  if (direction > 0 && book.turned < leaves.length) {
+    const leaf = leaves[book.turned++];
+    leaf.style.zIndex = String(leaves.length * 3); // on top of both stacks while it swings over
+    leaf.classList.add('turned');
+    setTimeout(stack, anim.enabled ? TURN_MS : 0);
+  } else if (direction < 0 && book.turned > 0) {
+    const leaf = leaves[--book.turned];
+    leaf.style.zIndex = String(leaves.length * 3);
+    leaf.classList.remove('turned');
+    setTimeout(stack, anim.enabled ? TURN_MS : 0);
+  } // (back at the front cover it stays: CLOSE, Esc or a click outside puts it away)
+}
+
+// Resting order: turned leaves on the left with the last one turned on top; the rest on the right, first on top.
+function stack() {
+  if (!book) return;
+  book.leaves.forEach((leaf, i) => { leaf.style.zIndex = String(i < book.turned ? i + 1 : book.leaves.length * 2 - i); });
+  // The front cover on its own, then the spreads inside counted from 1 (the booklet opens at the first of them).
+  book.where.textContent = book.turned ? t('{n} OF {total}', { n: book.turned, total: book.leaves.length }) : t('COVER');
+  book.back.disabled = book.turned === 0; book.forward.disabled = book.turned >= book.leaves.length; // (nothing that way)
+}
+
+/** Closes the booklet back into the case (and the art back into the corner). */
+export async function closeBooklet() {
+  if (!book || book.closing) return;
+  const b = book;
+  b.closing = true;
+  window.removeEventListener('keydown', onKey, true);
+  clearInterval(b.lyricsTimer);
+  if (b.turned > 0) {
+    b.leaves.forEach((leaf) => leaf.classList.remove('turned'));
+    b.turned = 0;
+    await wait(TURN_MS * 0.6);
+    stack(); // (the front cover on top again, shut: it's what's seen as it's put away)
+  }
+  if (b.from && b.lid && anim.enabled) { // shut, back the way it came, and into the lid's tabs
+    const size = b.spread.offsetHeight, target = b.spread.getBoundingClientRect();
+    b.root.classList.add('leaving');
+    lidView(b.root, b.lid);
+    b.spread.style.transition = 'none'; b.spread.style.transformOrigin = `${size}px 0`;
+    const path = lidPath(b.from, target, size, b.lid);
+    const a = b.spread.animate(pathFrames((u) => ({ transform: path.at(1 - u) }), 60), { duration: LID_BACK_MS, easing: 'linear', fill: 'forwards' });
+    setTimeout(() => b.spread.classList.add('in-lid'), LID_BACK_MS * (1 - path.faced));
+    setTimeout(() => { if (b.lid.back) b.lid.back(); }, LID_BACK_MS * 0.97);
+    await a.finished.catch(() => {});
+    b.root.remove();
+    book = null;
+    b.content.onClose();
+    return;
+  }
+  if (b.from && anim.enabled) {
+    const size = b.spread.offsetHeight, target = b.spread.getBoundingClientRect();
+    b.spread.style.transform = `translate(${b.from.left - (target.left + size)}px, ${b.from.top - target.top}px) scale(${b.from.width / size})`;
+    b.root.classList.add('leaving');
+  }
+  await wait(LIFT_MS);
+  b.root.remove();
+  book = null;
+  if (b.lid && b.lid.back) b.lid.back();
+  b.content.onClose();
+}
+
+/** An album booklet whose content changed (more lyrics found): its pages again, open at the page being read. */
+export function refreshBooklet(content) {
+  if (!book || book.closing || book.content !== content) return;
+  const key = readingKey();
+  book.leaves.forEach((leaf) => leaf.remove());
+  buildLeaves();
+  const found = spreadWith(key);
+  const turned = found >= 0 ? found : Math.min(book.turned, book.leaves.length);
+  book.turned = turned;
+  keepReading(turned, key);
+  book.leaves.forEach((leaf, i) => {
+    leaf.style.transition = 'none';
+    leaf.classList.toggle('turned', i < turned);
+    void leaf.offsetWidth;
+    leaf.style.transition = '';
+  });
+  book.lastLine = -2; // the new pages get the line being sung highlighted again
+  stack();
+}
+
+// The page being read: the one the reader last turned to (the left page of the spread, or the right one at the front
+// cover). Remembered at each turn — not worked out again from what's showing after pages were put in before it, when
+// the page beside it can be one the reader never turned to.
+const pageOn = (leaf, side) => { const page = leaf && leaf.querySelector(`.face.${side} .page`); return page ? page.dataset.key : null; };
+function readingKey() {
+  if (book.reading === undefined || book.reading.turned !== book.turned) {
+    book.reading = { turned: book.turned, key: pageOn(book.leaves[book.turned - 1], 'back') || pageOn(book.leaves[book.turned], 'front') };
+  }
+  return book.reading.key;
+}
+// The spread (how many leaves turned) that shows the page with this key, on whichever side it has landed. → -1 if none.
+function spreadWith(key) {
+  if (!key) return -1;
+  for (let i = 0; i < book.leaves.length; i++) {
+    if (pageOn(book.leaves[i], 'back') === key) return i + 1;
+    if (pageOn(book.leaves[i], 'front') === key) return i;
+  }
+  return -1;
+}
+// After a rebuild the reader is still on the page they turned to, even though it may now be the right-hand page.
+function keepReading(turned, key) { book.reading = { turned, key }; }
+
+function buildLeaves() {
+  const { spread, content } = book;
+  const size = spread.offsetHeight;
+  book.leaves = leavesFor(frontCover(content), insidePages(content, spread, size), backCover(content), blankPage)
+    .map((pages, i) => {
+      const leaf = el('div', { class: 'leaf' }, face(pages.front, 'front'), face(pages.back, 'back'));
+      leaf.dataset.index = i;
+      spread.append(leaf);
+      return leaf;
+    });
+}
+
+// ---- Pages ---------------------------------------------------------------------------------------------------------
+
+function pageSize() {
+  if (onPhone()) return Math.round(Math.max(200, Math.min(520, window.innerHeight - 200, window.innerWidth - 16))); // (one page across)
+  return Math.round(Math.max(240, Math.min(520, window.innerHeight - 200, (window.innerWidth - 100) / 2)));
+}
+// A phone (Android): a spread is too wide to read whole upright, so it's read a page at a time — one page across the
+// screen, the booklet slid to show its left page or its right; a tap on the right goes on (the right page, then the
+// next spread's left), on the left goes back.
+const onPhone = () => document.body.dataset.platform === 'android';
+function view(side) {
+  if (!book || !onPhone()) return;
+  book.side = side;
+  const size = pageSize();
+  // (with the lift out of the case, which may still be going, kept as it was)
+  book.spread.style.transition = anim.enabled ? `transform ${LIFT_MS}ms cubic-bezier(.2,.7,.2,1), left 260ms cubic-bezier(.2,.7,.2,1)` : 'none';
+  book.spread.style.left = `${side === 'left' ? 8 : 8 - size}px`;
+}
+function step(direction) {
+  if (!book || book.closing) return;
+  if (!onPhone()) { turn(direction); return; }
+  if (direction > 0) {
+    if (book.turned > 0 && book.side === 'left') view('right');
+    else if (book.turned < book.leaves.length) { turn(1); view('left'); }
+  } else if (book.turned > 0 && book.side === 'right') view('left');
+  else if (book.turned > 0) { turn(-1); view('right'); }
+}
+function face(page, side) {
+  const f = el('div', { class: `face ${side}` }, page);
+  return f;
+}
+const blankPage = () => el('div', { class: 'page blank' });
+const heading = (text, sub) => el('div', { class: 'page-head' }, el('div', { class: 'page-title' }, text), sub ? el('div', { class: 'page-sub' }, sub) : null);
+
+// The album's colours: AUTO's palette from the cover art (so each booklet is printed differently).
+function applyColors(node, cover, paper = false) {
+  const t = deriveAutoTheme(cover);
+  const s = node.style;
+  if (paper) { // a jewel case's: printed on light card — the cover's colour faint in the paper, darkened for the type
+    const mix = (a, b, k) => a.map((v, i) => Math.round(v + (b[i] - v) * k));
+    s.setProperty('--b-paper', rgb(mix([238, 234, 224], t.accent, 0.07)));
+    s.setProperty('--b-ink', rgb([30, 28, 32]));
+    s.setProperty('--b-muted', rgb([104, 100, 104]));
+    s.setProperty('--b-accent', rgb(mix(t.accent, [0, 0, 0], 0.45)));
+    s.setProperty('--b-accent2', rgb(mix(t.accent2, [0, 0, 0], 0.5)));
+    node.classList.add('paper');
+    return;
+  }
+  s.setProperty('--b-paper', rgb(t.card));
+  s.setProperty('--b-ink', rgb(t.text));
+  s.setProperty('--b-muted', rgb(t.muted));
+  s.setProperty('--b-accent', rgb(t.accent));
+  s.setProperty('--b-accent2', rgb(t.accent2));
+}
+
+// ---- What's printed ------------------------------------------------------------------------------------------------
+// A booklet's content: { cover (an <img>, or null), marker: { title, artist } for a CD-R without one, tracks: {
+// title, sub, rows: [{ name, time, current, tip, play() }] }, lyrics: [{ key, title, raw, live }] (live: the song
+// playing, whose line being sung is highlighted), credits: { sub, rows, none, summaryTitle, summary }, back: { title,
+// artist, names, count, total, copyright, label, catalog, barcode }, liveLyrics(): the playing song's lyrics or null,
+// start(), onClose() }.
+
+// This album's tracks from the queue (same album tag), or the whole queue when the song has no album.
+// The songs of the changer disc that's playing — or, in the queue, the playing album's songs in it (all of it without one).
+function albumTracks(app) {
+  const { state } = app, d = state.details;
+  const all = state.queue.map((p, i) => ({ p, i, d: app.detailsFor(p) }));
+  if (app.changerMode()) {
+    const disc = app.changerState().slots.find((x) => x && state.index >= x.start && state.index < x.end);
+    return disc ? all.slice(disc.start, disc.end) : all;
+  }
+  const same = d.album ? all.filter((x) => x.d && sameAlbum(x.d.album, d.album)) : [];
+  return same.length ? same : all;
+}
+
+/** The current track's booklet. */
+async function songContent(app) {
+  const { state } = app, d = state.details, c = d.credits || {};
+  const tracks = albumTracks(app);
+  const total = tracks.reduce((s, t) => s + ((t.d && t.d.duration) || 0), 0);
+  const plays = await app.cdp.playCount(state.loadedPath).catch(() => 0);
+  return {
+    cover: state.cover, marker: { title: d.title, artist: d.artist },
+    tracks: {
+      title: d.album || (app.changerMode() ? t('IN THE CHANGER') : t('IN THE QUEUE')), sub: d.artist,
+      rows: tracks.map((tr) => ({
+        name: tr.d ? tr.d.title : app.displayName(tr.p), time: tr.d && tr.d.duration ? app.formatTime(tr.d.duration) : '',
+        current: tr.i === state.index, tip: t('Play {song}', { song: app.queueDisplay(tr.p) }), play: () => app.playQueueIndex(tr.i),
+      })),
+    },
+    lyrics: state.lyrics ? [{ key: 'lyrics', title: t('LYRICS'), sub: d.title, raw: state.lyrics, live: true }] : [],
+    credits: {
+      sub: d.title, none: t('No credits in this file’s tags.'), summaryTitle: t('THIS DISC'),
+      rows: [
+        [t('WRITTEN BY'), [c.composer, c.lyricist && c.lyricist !== c.composer ? c.lyricist : null].filter(Boolean).join(' · ')],
+        [t('PRODUCED BY'), c.producer], [t('CONDUCTED BY'), c.conductor], [t('ALBUM ARTIST'), c.albumArtist !== d.artist ? c.albumArtist : null],
+        [t('RELEASED'), formatReleased(c.released, locale)], [t('GENRE'), c.genre], [t('LABEL'), c.label], [t('CATALOG NO.'), c.catalog],
+        [t('TRACK'), c.track ? `${c.track.no}${c.track.of ? ` ${t('OF').toLowerCase()} ${c.track.of}` : ''}` : null],
+        [t('DISC'), c.disc ? `${c.disc.no}${c.disc.of ? ` ${t('OF').toLowerCase()} ${c.disc.of}` : ''}` : null], ['BPM', c.bpm],
+      ].filter(([, v]) => v),
+      summary: [
+        [t('FORMAT'), d.quality || d.ext], [t('LENGTH'), app.formatTime(d.duration || app.engine.duration)],
+        [t('COVER'), app.coverSource()], [t('LYRICS'), state.lyrics ? state.lyricsSource || (d.lyrics ? t('In the file') : t('Online')) : null],
+        [t('PLAYED'), plays ? (plays === 1 ? t('1 time') : t('{n} times', { n: plays })) : null],
+      ].filter(([, v]) => v),
+    },
+    back: {
+      title: d.album || d.title, artist: d.artist ? c.albumArtist || d.artist : null,
+      names: tracks.map((t) => (t.d ? t.d.title : app.displayName(t.p))), count: tracks.length, total,
+      copyright: c.copyright, label: c.label, catalog: c.catalog, barcode: c.barcode,
+    },
+    liveLyrics: () => app.state.lyrics,
+    onClose: () => { app.disc.artOpen = false; }, // the art shrinks back into the corner of the case
+    story: null, openStory: (url) => app.cdp.openStory(url),
+    start() {
+      tellStory(app, this, { releaseId: c.albumMbid, artist: c.albumArtist || d.artist, album: d.album, title: d.title });
+      findScans(app, this, { releaseId: c.albumMbid || null, artist: c.albumArtist || d.artist, album: d.album });
+    },
+  };
+}
+
+// The album's story from Wikipedia (main/album-story.js), slotted in after the tracklist once it's found.
+// MusicBrainz busy (it often is): asked again a little later, while the booklet is still open, twice at most.
+function tellStory(app, content, query, tries = 3) {
+  if (!query.artist || !(query.album || query.title)) return;
+  app.cdp.albumStory(query).then((story) => {
+    if (story && story.unavailable) {
+      if (tries > 1) setTimeout(() => { if (isBookletOpen() && book.content === content) tellStory(app, content, query, tries - 1); }, 15000);
+      return;
+    }
+    if (!story) return;
+    content.story = story;
+    // Come while the booklet's being read (not just as it opens): at the end, so the page being read stays put.
+    content.storyLate = isBookletOpen() && book.content === content && performance.now() - book.openedAt > 1500;
+    refreshBooklet(content);
+  }).catch(() => {});
+}
+
+// The real booklet's scans, the case's back and what's under the disc (main/booklet-scans.js), when someone has put
+// them up: slotted in after the album's story — or at the end, when they came while the booklet was being read.
+function findScans(app, content, query) {
+  if (!query.artist || !query.album || !app.cdp.bookletScans) return;
+  app.cdp.bookletScans(query).then((scans) => {
+    if (!scans || !scans.length || !isBookletOpen() || book.content !== content) return;
+    content.scans = scans;
+    content.scansLate = performance.now() - book.openedAt > 1500;
+    refreshBooklet(content);
+  }).catch(() => {});
+}
+
+/**
+ * The booklet of a shelf album ({ title, artist, year, discs, tracks: [{ path, title, duration }] }), with its cover
+ * (an <img>, or null). `play(i)` plays the album from track i. Lyrics inside the files are there at once; the rest
+ * are looked up online once it's open, a few at a time, and slot in as they're found.
+ */
+export async function albumBooklet(app, album, cover, { play, onClose = () => {}, wholeList = null }) {
+  const details = await Promise.all(album.tracks.map((t) => app.cdp.details(t.path, { withCover: false }).catch(() => null)));
+  const plays = await Promise.all(album.tracks.map((t) => app.cdp.playCount(t.path).catch(() => 0)));
+  const pressing = ((await app.cdp.discogsKnown([album.id]).catch(() => ({})))[album.id] || {}).info || null;
+  const times = await app.cdp.playTimes(album.tracks.map((t) => t.path)).catch(() => ({ first: [], last: [] }));
+  // The hidden songs heard on it (hidden-track.js): written in under their track.
+  const hidden = await Promise.all(album.tracks.map((tr, i) => app.cdp.hidden.get(tr.path)
+    .then((g) => (g && g.entry && g.entry.found ? hiddenName(g.entry, details[i] || { title: tr.title }) || t('Hidden track') : null)).catch(() => null)));
+  const marks = ownerMarks({ plays, first: album.tracks.map((t, i) => times.first[i] || null), last: album.tracks.map((t, i) => times.last[i] || null), through: times.through || 0 });
+  const small = albumSmallPrint(details);
+  const playing = () => album.tracks.findIndex((t) => t.path === app.state.loadedPath);
+  const found = album.tracks.map((t, i) => (details[i] && details[i].lyrics) || null);
+  const content = {
+    cover, marker: { title: album.title, artist: album.artist },
+    tracks: {
+      title: album.title, sub: [album.artist, album.year, album.discs > 1 ? t('{n} DISCS', { n: album.discs }) : null].filter(Boolean).join(' · '),
+      // The album's whole tracklist when the case knows it: the songs you don't have in their places, in grey. A set's
+      // disc by disc, a DISC 2 heading before each (box-set.js).
+      rows: withDiscHeads(penHidden(wholeList ? wholeList.map((r) => {
+        const i = r.have ? album.tracks.indexOf(r.have) : -1;
+        return i < 0 ? { no: r.no, name: r.title, time: r.length ? app.formatTime(r.length) : '', missing: true, tip: t('Not in your collection'), track: -1 }
+          : { no: r.no, name: r.have.title, time: r.have.duration ? app.formatTime(r.have.duration) : '', current: i === playing(), tip: t('Play {song}', { song: r.have.title }), play: () => play(i), tally: marks.tallies[i], favorite: i === marks.favorite, track: i };
+      }) : album.tracks.map((tr, i) => ({
+        no: tr.track || null, // its number on the album (a song you have of it isn't necessarily its first)
+        name: tr.title, time: tr.duration ? app.formatTime(tr.duration) : '', current: i === playing(), tip: t('Play {song}', { song: tr.title }), play: () => play(i),
+        tally: marks.tallies[i], favorite: i === marks.favorite, track: i,
+      })), hidden), (r) => (r.track >= 0 ? album.tracks[r.track].disc : null)),
+    },
+    lyrics: [],
+    credits: { sub: album.title, none: t('No credits in these files’ tags.'), rows: albumCredits(details, pressing), summaryTitle: t('THIS ALBUM'), summary: albumSummary({ details, plays, discs: album.discs }) },
+    back: {
+      title: album.title, artist: album.artist, names: wholeList ? wholeList.map((r) => r.title) : album.tracks.map((t) => t.title), count: wholeList ? wholeList.length : album.tracks.length,
+      total: album.tracks.reduce((s, t) => s + (t.duration || 0), 0), ...small, notes: marks.notes,
+    },
+    // The playing song's lines are highlighted as they're sung — with the lyrics the player has for it.
+    liveLyrics: () => { const i = playing(); return i >= 0 ? app.state.lyrics || found[i] : null; },
+    onClose,
+  };
+  const setLyrics = () => {
+    const live = playing();
+    content.lyrics = album.tracks.map((t, i) => {
+      const raw = i === live && app.state.lyrics ? app.state.lyrics : found[i];
+      return raw ? { key: `lyrics:${i}`, title: t.title.toUpperCase(), sub: t.artist && t.artist !== album.artist ? t.artist : null, raw, live: i === live } : null;
+    }).filter(Boolean);
+  };
+  setLyrics();
+  content.openStory = (url) => app.cdp.openStory(url);
+  content.start = () => {
+    const releaseId = (details.find((d) => d && d.credits && d.credits.albumMbid) || { credits: {} }).credits.albumMbid;
+    tellStory(app, content, { releaseId, artist: album.artist, album: album.title });
+    findScans(app, content, { releaseId: releaseId || null, artist: album.artist, album: album.title });
+    const missing = album.tracks.map((t, i) => i).filter((i) => !found[i] && details[i]);
+    let next = 0;
+    const worker = async () => {
+      while (next < missing.length && book && book.content === content) {
+        const i = missing[next++], d = details[i];
+        const got = await app.cdp.findLyrics({ artist: d.artist || album.artist, title: d.title || album.tracks[i].title, album: d.album || album.title, duration: d.duration }).catch(() => null);
+        if (got && got.lyrics) { found[i] = got.lyrics; setLyrics(); refreshBooklet(content); }
+      }
+    };
+    for (let k = 0; k < 3; k++) worker();
+  };
+  return content;
+}
+
+function frontCover(content) {
+  const { cover, marker } = content;
+  const page = cover ? el('div', { class: 'page cover' }, el('img', { src: cover.src, alt: '' }))
+    // No art at all: a blank CD-R with the title written on in marker.
+    : el('div', { class: 'page cover cdr' }, el('div', { class: 'marker' }, marker.title), marker.artist ? el('div', { class: 'marker small' }, marker.artist) : null);
+  page.dataset.key = 'cover';
+  return page;
+}
+
+function insidePages(content, spread, size) {
+  const pages = [];
+  const sizer = el('div', { class: 'page measuring' });
+  Object.assign(sizer.style, { width: `${size}px`, height: `${size}px` });
+  spread.append(sizer);
+  // Fills pages with rows while they fit, measuring each in an invisible page of the same size. Each page is keyed
+  // (section and page number), so a booklet built again can open at the same page.
+  const layout = (key, head, rows) => paginate(rows, (onPage) => {
+    sizer.replaceChildren(head(), el('div', { class: 'page-body' }, onPage.map((r) => r())));
+    return sizer.scrollHeight <= sizer.clientHeight;
+  }).map((onPage, n) => {
+    const page = el('div', { class: 'page' }, head(n), el('div', { class: 'page-body' }, onPage.map((r) => r())));
+    page.dataset.key = `${key}:${n}`;
+    return page;
+  });
+
+  // Tracklist.
+  const { tracks } = content;
+  pages.push(...layout('tracks', (n) => heading(n ? t('{title} (cont.)', { title: tracks.title }) : tracks.title, n ? null : tracks.sub), tracks.rows.map((t, k) => () => {
+    if (t.disc) return el('div', { class: 'disc-head' }, discHeading(t.disc)); // a set's next disc
+    if (t.pen) { // a hidden song written in under its track: no number, no time, a little crooked
+      return el('div', { class: 'track hidden-pen' }, el('span', { class: 'no' }), el('span', { class: 'name' }, el('span', { class: 'pen', style: `display: inline-block; transform: rotate(${((k * 37) % 5) - 2}deg)` }, `+ ${t.name}`)));
+    }
+    const row = el('div', { class: `track${t.current ? ' current' : ''}${t.favorite ? ' favorite' : ''}${t.missing ? ' missing' : ''}`, 'data-play': t.play ? k : null, title: t.tip },
+      el('span', { class: 'no' }, String(t.no || (t.track >= 0 ? t.track + 1 : k + 1)).padStart(2, '0')),
+      el('span', { class: 'name' }, el('span', { class: 'title' }, t.name)),
+      t.tally ? tallyMarks(t.tally, k) : null, // beside the name, never cut off with a long one
+      el('span', { class: 'time' }, t.time));
+    row.addEventListener('click', (e) => { e.stopPropagation(); if (t.play) t.play(); }); // (a song you don't have: nothing, not a page turn)
+    return row;
+  })));
+
+  // About the album: Wikipedia's introduction, the date it came out, and where it's from. After the tracklist — or,
+  // when it came while the booklet was open, at the end (before the back), so it doesn't push on the page being read.
+  const { story } = content;
+  const addStory = () => {
+    if (!story) return;
+    // Sentence by sentence, flowing on as one text (a page turns between sentences); a gap between paragraphs.
+    const pieces = storyChunks(story.paragraphs, 0);
+    const rows = pieces.flatMap((c, i) => [() => el('span', { class: 'story' }, `${c.text} `), ...(c.end && i < pieces.length - 1 ? [() => el('div', { class: 'story-gap' })] : [])]);
+    rows.push(() => el('div', { class: 'story-source', 'data-link': '', title: story.url, onClick: () => content.openStory && content.openStory(story.url) },
+      t('From Wikipedia: “{title}” · CC BY-SA', { title: story.title })));
+    // A single's (or an EP's) article is mostly about its song: the page says what the release is.
+    const about = story.kind === 'Single' ? t('ABOUT THE SINGLE') : story.kind === 'EP' ? t('ABOUT THE EP') : t('ABOUT THE ALBUM');
+    pages.push(...layout('story', (n) => heading(n ? t('{title} (cont.)', { title: about }) : about, n ? null : releasedLine(story.released, { locale })), rows));
+  };
+  if (!content.storyLate) addStory();
+
+  // The real booklet, scanned: a page each — a scan of two pages side by side across a spread, its left half on a
+  // left-hand page (a blank first when it would land on a right one).
+  const addScans = () => {
+    (content.scans || []).forEach((scan, i) => {
+      const img = () => el('img', { src: scan.art, alt: '', draggable: 'false' });
+      const scanPage = (key, half) => { const p = el('div', { class: `page scan${half ? ` half ${half}` : ''}` }, img()); p.dataset.key = key; return p; };
+      if (scan.width / scan.height > 1.6) {
+        if (pages.length % 2) { const b = blankPage(); b.dataset.key = `scan:${i}:blank`; pages.push(b); }
+        pages.push(scanPage(`scan:${i}`, 'left'), scanPage(`scan:${i}:r`, 'right'));
+      } else pages.push(scanPage(`scan:${i}`));
+    });
+  };
+  if (!content.scansLate) addScans();
+
+  // Lyrics: each song's on its own pages.
+  for (const song of content.lyrics) {
+    const synced = parseLrc(song.raw);
+    const lines = synced.length ? synced.map((l, i) => ({ text: l.text, i })) : formatLyricsForDisplay(song.raw).split('\n').map((text) => ({ text }));
+    pages.push(...layout(song.key, (n) => heading(n ? t('{title} (cont.)', { title: song.title }) : song.title, n ? null : song.sub), lines.map((l) => () => {
+      const line = el('div', { class: `lyric${l.text ? '' : ' gap'}` }, l.text || ' ');
+      if (l.i != null && song.live) line.dataset.line = l.i;
+      return line;
+    })));
+  }
+
+  // Credits, and this disc or album.
+  const { credits } = content;
+  const dl = (list) => el('dl', { class: 'credits' }, list.flatMap(([k, v]) => [el('dt', {}, k), el('dd', {}, String(v))]));
+  const page = el('div', { class: 'page' }, heading(t('CREDITS'), credits.sub), el('div', { class: 'page-body' },
+    credits.rows.length ? dl(credits.rows) : el('div', { class: 'none' }, credits.none),
+    el('div', { class: 'page-title small' }, credits.summaryTitle), dl(credits.summary)));
+  page.dataset.key = 'credits:0';
+  pages.push(page);
+  if (content.storyLate) addStory();
+  if (content.scansLate) addScans();
+
+  sizer.remove();
+  return pages;
+}
+
+// Tally marks in pen beside a song: bundles of four strokes crossed by a fifth, then the odd ones — or "×47".
+function tallyMarks(tally, k) {
+  const pen = el('span', { class: 'pen tally', style: `transform: rotate(${((k * 37) % 7) - 3}deg)` });
+  if (tally.times) { pen.textContent = tally.times; return pen; }
+  for (let i = 0; i < tally.fives; i++) pen.append(el('span', { class: 'five' }, '||||'));
+  if (tally.ones) pen.append(el('span', {}, '|'.repeat(tally.ones)));
+  return pen;
+}
+function backCover(content) {
+  const b = content.back;
+  const code = ean13(b.barcode);
+  const page = el('div', { class: 'page back-cover' },
+    el('div', { class: 'back-title' }, b.title),
+    b.artist ? el('div', { class: 'back-artist' }, b.artist) : null,
+    el('ol', { class: 'back-tracks' }, b.names.slice(0, 20).map((name) => el('li', {}, name))),
+    el('div', { class: 'back-total' }, [b.count === 1 ? t('1 TRACK') : t('{n} TRACKS', { n: b.count }), b.total ? formatTotal(b.total) : null].filter(Boolean).join(' · ')),
+    el('div', { class: 'small-print' },
+      b.copyright ? el('div', {}, /[©℗]/.test(b.copyright) ? b.copyright : `℗ © ${b.copyright}`) : null,
+      b.label || b.catalog ? el('div', {}, [b.label, b.catalog].filter(Boolean).join(' · ')) : null,
+      code ? barcode(code) : null,
+      el('div', { class: 'made-with' }, t('PLAYED ON CDPLAYER'))),
+    b.notes && b.notes.length ? el('div', { class: 'pen-notes' }, b.notes.map((n) => el('div', {}, n))) : null);
+  page.dataset.key = 'back';
+  return page;
+}
+const formatTotal = (seconds) => { const s = Math.max(0, Math.floor(seconds)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+function barcode({ digits, bits }) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${bits.length} 30`);
+  svg.setAttribute('class', 'barcode');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  for (let i = 0; i < bits.length; i++) {
+    if (bits[i] !== '1') continue;
+    const bar = document.createElementNS(NS, 'rect');
+    bar.setAttribute('x', i); bar.setAttribute('width', 1); bar.setAttribute('height', 30);
+    svg.append(bar);
+  }
+  return el('div', { class: 'barcode-box' }, svg, el('div', { class: 'barcode-digits' }, digits));
+}
+
+// Synced lyrics: the line being sung is highlighted on the lyrics pages while the booklet is open.
+function startLyricsHighlight(app) {
+  let raw = null, lines = [];
+  book.lastLine = -2;
+  book.lyricsTimer = setInterval(() => {
+    if (!book) return;
+    const now = book.content.liveLyrics();
+    if (now !== raw) { raw = now; lines = raw ? parseLrc(raw) : []; book.lastLine = -2; }
+    if (!lines.length) return;
+    const i = currentLineIndex(lines, app.lyricsPosition());
+    if (i === book.lastLine) return;
+    book.lastLine = i;
+    book.spread.querySelectorAll('.lyric.now').forEach((n) => n.classList.remove('now'));
+    book.spread.querySelectorAll(`.lyric[data-line="${i}"]`).forEach((n) => n.classList.add('now'));
+  }, 200);
+}

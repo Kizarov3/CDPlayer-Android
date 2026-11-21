@@ -1,0 +1,31 @@
+<!doctype html>
+<!-- Shown instead of the player when the phone's Android System WebView is older than capacitor.config.json's
+     minWebViewVersion (Capacitor's errorPath). Plain HTML and ES5: whatever WebView it is, it can show this. -->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CDPlayer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0f0d0e; color: #eee; font-family: sans-serif; }
+  .box { box-sizing: border-box; min-height: 100%; padding: 48px 28px; display: flex; flex-direction: column; justify-content: center; }
+  h1 { color: #e0283a; font-size: 18px; letter-spacing: .08em; margin: 0 0 16px; }
+  p { font-size: 15px; line-height: 1.5; color: #bbb; margin: 0 0 28px; }
+  a { display: inline-block; align-self: flex-start; padding: 12px 22px; border-radius: 24px; background: #c81e2e; color: #fff; text-decoration: none; font-weight: bold; letter-spacing: .06em; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1 id="title">CDPLAYER NEEDS A NEWER WEBVIEW</h1>
+  <p id="text">It draws the player with Android System WebView, and the one on this phone is too old for it. Update it on Google Play, then open CDPlayer again.</p>
+  <a id="update" href="market://details?id=com.google.android.webview">UPDATE WEBVIEW</a>
+</div>
+<script>
+  if (/^ru/i.test(navigator.language || '')) {
+    document.getElementById('title').textContent = 'CDPLAYER НУЖЕН НОВЫЙ WEBVIEW';
+    document.getElementById('text').textContent = 'Плеер рисуется через Android System WebView, а на этом телефоне он слишком старый. Обновите его в Google Play и откройте CDPlayer снова.';
+    document.getElementById('update').textContent = 'ОБНОВИТЬ WEBVIEW';
+  }
+</script>
+</body>
+</html>

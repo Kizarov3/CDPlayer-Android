@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+build/bin/
+build/linux/generated/
+
+src/main/karaoke/models/*
+!src/main/karaoke/models/aligner.onnx
+dist-site/
+
+dist-android/
+android-spike/

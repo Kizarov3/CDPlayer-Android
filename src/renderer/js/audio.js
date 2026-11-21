@@ -1,0 +1,602 @@
+// Playback engine. Each track plays from its own "deck" (an <audio> element streaming from the cdp:// media
+// protocol, so seeking is instant and memory stays flat), routed through one shared Web Audio graph:
+//
+//   deck → trim (Sound Check) → bass cut (AUTOMIX) → deck gain (crossfade) ─┐
+//   deck → trim (Sound Check) → bass cut (AUTOMIX) → deck gain (crossfade) ─┴→ mono downmix → 10-band EQ → spatial audio → analyser (visualizer/beats) → volume → guard → speakers
+//
+// That graph replaces the Java app's hand-written PCM pump: gain, mono, EQ and crossfade are all native nodes.
+// The guard is a WaveShaper between ×0.5 and ×2 (both exact in floats) with no curve — it passes the sound untouched —
+// except while two songs overlap (a crossfade, a mix), when automix.js softClipCurve keeps their sum from clipping.
+//
+// Gapless (gapless.js): the next track waits on a standby deck and is started this long before the playing one
+// ends — an <audio> element starts on the audio pipeline's block grid, about 10 ms after play() (measured: 11 ms
+// early gives a seam of ~0) — with a 5 ms equal-power blend across the seam to hide the millisecond or two left.
+export const SEAM_LEAD = 0.011, SEAM_WATCH = 0.15, SEAM_BLEND = 0.005, SEAM_STEP = 0.045;
+//
+// AUTOMIX (automix.js) uses the same standby and timing, but the seam is armed (armMix) at a moment before the end —
+// where the playing song winds down — and the two overlap for seconds: the playing song fading and losing its bass
+// through a rising high-pass (or, a song that stops dead, playing on as it is), the next one coming up under it.
+//
+// A deck can also play just a stretch of its file — a cue sheet track inside an album-length rip. position,
+// duration and seek are then relative to that stretch, and reaching its end counts as the track ending.
+
+import { Spatializer } from './spatial.js';
+import { powerEnvelope } from './hidden-track.js';
+
+import { BASS_CUT_HZ, softClipCurve } from './automix.js';
+
+// An equal-power (sin/cos) curve: rising (from `from`, 0 = silence), or falling.
+function equalPower(rising, n = 64, from = 0) {
+  const c = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const a = (i / (n - 1)) * (Math.PI / 2); c[i] = rising ? from + (1 - from) * Math.sin(a) : Math.cos(a); }
+  return c;
+}
+
+const GUARD_CURVE = softClipCurve();
+
+export const EQ_FREQUENCIES = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+
+// The player's own pauses, told apart from a pause from outside (the 'pause' event can't say whose it was).
+const hush = (el) => { el.cdpOwnPause = true; el.pause(); };
+
+export class AudioEngine {
+  constructor() {
+    this.volume = 1; this.mono = false; this.eqGains = new Array(EQ_FREQUENCIES.length).fill(0);
+    this.outputId = '';
+    this.customRate = null;    // Settings → QUALITY: the song's rate, or null for the system's
+    this.standby = null; this.seamTimer = null; this.onAdvance = null; this.seaming = null; // gapless: the next track, waiting (seaming: the deck handing over)
+    this.mix = null; // AUTOMIX: the standby's mix plan (automix.js mixPlan), or null for a gapless seam
+    this.spatialOn = false; this.spatialAmount = 0.5; // Settings → SPATIAL AUDIO (spatial.js)
+    this.contextListeners = [];
+    this.guarding = false;     // the clipping guard's curve is on (two songs overlap)
+    this.build(null);
+    this.deck = null;          // the current track
+    this.fadingOut = null;     // the previous track, while a crossfade is in progress
+    this.fadeTimer = null;
+    this.onEnded = null;
+    this.onExternalPause = null; this.onExternalResume = null;
+  }
+
+  /** The graph, in a new context at `rate` (null: the system's), with the volume, mono, EQ and spatial audio it had. */
+  build(rate) {
+    const ctx = new AudioContext(rate ? { sampleRate: rate, latencyHint: 'playback' } : { latencyHint: 'playback' });
+    this.ctx = ctx;
+    this.input = ctx.createGain();
+    this.asleep = false; // (a new graph starts connected: see sleepSoon)
+    this.eq = EQ_FREQUENCIES.map((f, i) => {
+      const b = ctx.createBiquadFilter();
+      b.type = 'peaking'; b.frequency.value = f; b.Q.value = 1.2; b.gain.value = this.eqGains[i]; // same RBJ peaking curve, Q 1.2, as the Java EQ
+      return b;
+    });
+    this.analyser = ctx.createAnalyser();
+    this.analyser.fftSize = 8192;
+    this.analyser.smoothingTimeConstant = 0;
+    this.master = ctx.createGain();
+    this.master.gain.value = this.volume;
+    this.spatial = new Spatializer(ctx);
+    let node = this.input;
+    for (const b of this.eq) { node.connect(b); node = b; }
+    node.connect(this.spatial.input);
+    this.spatial.output.connect(this.analyser);
+    this.analyser.connect(this.master);
+    // Each side heard on its own too, for HI-FI's two level meters.
+    const split = ctx.createChannelSplitter(2);
+    this.spatial.output.connect(split);
+    this.sides = [0, 1].map((ch) => { const a = ctx.createAnalyser(); a.fftSize = 2048; split.connect(a, ch); return a; });
+    const halve = ctx.createGain(), double = ctx.createGain();
+    halve.gain.value = 0.5; double.gain.value = 2;
+    this.guard = ctx.createWaveShaper();
+    this.guard.curve = this.guarding ? GUARD_CURVE : null;
+    this.master.connect(halve); halve.connect(this.guard); this.guard.connect(double); double.connect(ctx.destination);
+    this.out = double;
+    this.samples = new Float32Array(this.analyser.fftSize);
+    this.freq = null;
+    this.recDest = null;
+    this.closeRecordingContext();
+    this.applyMono();
+    this.applySpatial({ now: true });
+  }
+
+  get rate() { return this.ctx.sampleRate; }
+  onContextChange(fn) { this.contextListeners.push(fn); }
+  /**
+   * Plays at `rate` from now on (null: the system's rate), by building the graph again in a new context — Web Audio
+   * can't change a context's rate. Whatever was playing (and fading) is dropped: the caller loads the next song.
+   * → false if the browser won't make a context at that rate; the engine then stays at the rate it had.
+   */
+  async setRate(rate) {
+    if ((rate || null) === this.customRate && (!rate || rate === this.ctx.sampleRate)) return true;
+    this.stop();
+    const old = this.ctx, oldNodes = { input: this.input, eq: this.eq, spatial: this.spatial, analyser: this.analyser, master: this.master, guard: this.guard, out: this.out, samples: this.samples };
+    try { this.build(rate); } catch {
+      Object.assign(this, { ctx: old }, oldNodes);
+      return false;
+    }
+    this.customRate = rate || null;
+    if (this.outputId && this.ctx.setSinkId) await this.ctx.setSinkId(this.outputId).catch(() => {});
+    for (const fn of this.contextListeners) fn(this.ctx);
+    old.close().catch(() => {});
+    return true;
+  }
+
+  /** The guard against clipping: on while two songs overlap, else off (no curve: the sound passes untouched). */
+  setGuard(on) { this.guarding = !!on; if (this.guard) this.guard.curve = on ? GUARD_CURVE : null; }
+  setVolume(v) { this.volume = v; this.master.gain.setTargetAtTime(v, this.ctx.currentTime, 0.01); }
+  /** Sound Check: the playing deck's own gain, before the crossfade's (1 = as it is). Ramped over `seconds`. */
+  setTrim(linear, seconds = 0) {
+    const t = this.deck && this.deck.trim;
+    if (!t) return;
+    t.gain.cancelScheduledValues(this.ctx.currentTime);
+    if (seconds > 0) t.gain.setTargetAtTime(linear, this.ctx.currentTime, seconds / 3);
+    else t.gain.value = linear;
+  }
+  setMono(on) { this.mono = on; this.applyMono(); this.applySpatial(); }
+  applyMono() {
+    // A 1-channel "explicit" node makes Web Audio sum L+R (×0.5 each) — exactly the Java version's (L+R)/2 —
+    // and the speakers then get that mono signal on both sides.
+    this.input.channelCount = this.mono ? 1 : 2;
+    this.input.channelCountMode = this.mono ? 'explicit' : 'max';
+    this.input.channelInterpretation = 'speakers';
+  }
+  /** Settings → SPATIAL AUDIO: on or off, and how much room (0–1). */
+  setSpatial(on, amount = this.spatialAmount) { this.spatialOn = !!on; this.spatialAmount = amount; this.applySpatial(); }
+  // Mono has one channel left, which would come from the left speaker alone: spatial audio waits while it's on.
+  applySpatial(opts) { this.spatial.set(this.spatialOn && !this.mono, this.spatialAmount, opts); }
+  setEq(gains) { this.eqGains = gains.slice(); gains.forEach((g, i) => this.eq[i].gain.setTargetAtTime(g, this.ctx.currentTime, 0.02)); }
+
+  /** A deck for `url` — or, given `element` (a Spotify track), one that plays through it, outside Web Audio. */
+  createDeck(url, element = null, trim = 1) {
+    const el = element || new Audio();
+    let source = null;
+    const gain = this.ctx.createGain();
+    let trimNode = null, filter = null;
+    if (!element) {
+      el.preload = 'auto';
+      el.src = url;
+      source = this.ctx.createMediaElementSource(el);
+      trimNode = this.ctx.createGain();
+      trimNode.gain.value = trim;
+      filter = this.ctx.createBiquadFilter(); // a high-pass at 0 Hz passes everything: only a mix moves it
+      filter.type = 'highpass'; filter.frequency.value = 0;
+      source.connect(trimNode);
+      trimNode.connect(filter);
+      filter.connect(gain);
+      gain.connect(this.input);
+    }
+    const deck = { el, source, trim: trimNode, filter, gain, url, start: 0, end: null, endFired: false };
+    el.addEventListener('play', () => {
+      el.cdpOwnPause = false;
+      this.wake(); // (however it was started: a crossfade's, a gapless seam's)
+      // Played on by what paused it (Android gives the music back after a call): said too.
+      if (deck.pausedFromOutside) { deck.pausedFromOutside = false; if (deck === this.deck && this.onExternalResume) this.onExternalResume(); }
+    });
+    // Paused by something other than the player (Android: a call, another app's music, the system): said, so the
+    // player doesn't go on showing it playing. (Ending, and a Spotify element pausing with its player, aren't that.)
+    el.addEventListener('pause', () => {
+      const own = el.cdpOwnPause;
+      el.cdpOwnPause = false;
+      if (own || element || el.ended || deck !== this.deck || deck === this.seaming) return;
+      deck.pausedFromOutside = true;
+      if (this.onExternalPause) this.onExternalPause();
+    });
+    el.addEventListener('ended', () => { if (this.onEnded && deck === this.deck && deck !== this.seaming) this.onEnded(deck); }); // a deck left behind (crossfade, gapless) ends unheard
+    // Reading the file failing in the song's last moments (a seek right up to its end can): no 'ended' comes, and the
+    // player would stand there "playing" for good — the song is over, so on to the next. (A load that fails is the
+    // load's to report: before the length is known this leaves it alone.)
+    el.addEventListener('error', () => {
+      if (!this.onEnded || deck !== this.deck || deck === this.seaming || !(el.duration > 0)) return;
+      const end = deck.end != null ? deck.end : el.duration;
+      if (end - el.currentTime < 2) this.onEnded(deck);
+    });
+    return deck;
+  }
+  disposeDeck(deck) {
+    if (!deck) return;
+    try { hush(deck.el); } catch { /* ignore */ }
+    deck.el.removeAttribute('src');
+    deck.el.load();
+    if (deck.source) deck.source.disconnect();
+    if (deck.trim) deck.trim.disconnect();
+    if (deck.filter) deck.filter.disconnect();
+    deck.gain.disconnect();
+  }
+
+  /**
+   * Loads a track. With crossfadeSeconds > 0 and something currently playing, the old deck keeps playing and
+   * fades out along an equal-power (cos/sin) curve while the new one fades in; otherwise the old deck stops now.
+   * Resolves once the new track's duration is known; rejects if it can't be decoded. `segment` ({ start, end } in
+   * seconds, end null for "to the end of the file") plays only that part of the file.
+   */
+  async load(url, { autoPlay = true, crossfadeSeconds = 0, segment = null, element = null, trim = 1 } = {}) {
+    this.cancelPrepared();
+    this.cancelCrossfade();
+    const outgoing = this.deck;
+    // A Spotify track plays outside Web Audio, so there's nothing to fade — in or out.
+    const doCrossfade = crossfadeSeconds > 0 && !element && outgoing && outgoing.source && !outgoing.el.paused;
+    if (!doCrossfade) { this.disposeDeck(outgoing); this.deck = null; }
+    // While the next track's length is awaited, the one to fade out is already fadingOut: a newer load or stop() in that
+    // moment (cancelCrossfade) stops it, rather than it playing on with nothing left that knows of it.
+    else this.fadingOut = outgoing;
+    const deck = this.createDeck(url, element, trim);
+    this.deck = deck;
+    await new Promise((resolve, reject) => {
+      const ok = () => { cleanup(); resolve(); };
+      const fail = () => { cleanup(); reject(new Error('decode')); };
+      const cleanup = () => { deck.el.removeEventListener('loadedmetadata', ok); deck.el.removeEventListener('error', fail); };
+      deck.el.addEventListener('loadedmetadata', ok);
+      deck.el.addEventListener('error', fail);
+    }).catch((e) => {
+      if (this.deck === deck) { this.disposeDeck(deck); this.deck = null; }
+      if (doCrossfade && this.fadingOut === outgoing) { this.disposeDeck(outgoing); this.fadingOut = null; }
+      throw e;
+    });
+    if (this.deck !== deck) return false; // superseded by a newer load while waiting
+    if (segment) { this.setSegment(segment); deck.el.currentTime = segment.start; }
+    if (doCrossfade) this.startCrossfade(outgoing, deck, crossfadeSeconds);
+    else deck.gain.gain.value = 1;
+    if (autoPlay) await this.play();
+    return true;
+  }
+
+  startCrossfade(outgoing, incoming, seconds) {
+    const n = 128, fadeOut = new Float32Array(n), fadeIn = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const angle = (i / (n - 1)) * (Math.PI / 2);
+      fadeOut[i] = Math.cos(angle); fadeIn[i] = Math.sin(angle);
+    }
+    const now = this.ctx.currentTime;
+    outgoing.gain.gain.cancelScheduledValues(now);
+    incoming.gain.gain.cancelScheduledValues(now);
+    outgoing.gain.gain.setValueCurveAtTime(fadeOut, now, seconds);
+    incoming.gain.gain.setValueCurveAtTime(fadeIn, now, seconds);
+    this.fadingOut = outgoing;
+    this.setGuard(true);
+    this.fadeTimer = setTimeout(() => {
+      this.fadeTimer = null;
+      if (this.fadingOut === outgoing) { this.disposeDeck(outgoing); this.fadingOut = null; this.setGuard(false); }
+      if (this.onCrossfadeDone) this.onCrossfadeDone();
+    }, seconds * 1000 + 50);
+  }
+  /** Stops an in-flight crossfade immediately (a manual track change mid-fade must not leave the old track bleeding). */
+  cancelCrossfade() {
+    if (this.fadeTimer) { clearTimeout(this.fadeTimer); this.fadeTimer = null; }
+    if (this.fadingOut) { this.disposeDeck(this.fadingOut); this.fadingOut = null; }
+    this.setGuard(false);
+    if (this.deck) {
+      const g = this.deck.gain.gain;
+      g.cancelScheduledValues(this.ctx.currentTime);
+      g.value = 1;
+    }
+  }
+  get crossfading() { return !!this.fadingOut; }
+
+  /** Switches the current deck to another stretch of the same file, without touching playback. */
+  setSegment({ start, end }) {
+    if (!this.deck) return;
+    Object.assign(this.deck, { start, end: end === null || end === undefined ? null : end, endFired: false });
+  }
+  /** True when the track now playing ends exactly where `start` of the same file begins: the album's next cue track. */
+  runsInto(url, start) {
+    const d = this.deck;
+    return !!d && !this.fadingOut && d.url === url && d.end !== null && Math.abs(d.end - start) < 0.01;
+  }
+  /** …and it's reached that point while playing, so the player can just carry on instead of reloading: gapless. */
+  continuesInto(url, start) {
+    return this.runsInto(url, start) && !this.deck.el.paused && this.deck.el.currentTime >= this.deck.end - 0.25;
+  }
+  /**
+   * Loads `url` on a standby deck — paused, silent, at `segment.start` (or `startAt`, past a song's leading silence) —
+   * to follow the playing one without a gap.
+   */
+  async prepare(url, { segment = null, trim = 1, startAt = 0 } = {}) {
+    this.cancelPrepared();
+    const deck = this.createDeck(url, null, trim);
+    deck.gain.gain.value = 0;
+    this.standby = deck;
+    const ok = await new Promise((resolve) => {
+      const done = (v) => () => { deck.el.removeEventListener('loadedmetadata', yes); deck.el.removeEventListener('error', no); resolve(v); };
+      const yes = done(true), no = done(false);
+      deck.el.addEventListener('loadedmetadata', yes);
+      deck.el.addEventListener('error', no);
+    });
+    if (this.standby !== deck) return false; // replaced or cancelled meanwhile (already disposed)
+    if (!ok) { this.cancelPrepared(); return false; }
+    if (segment) { Object.assign(deck, { start: segment.start, end: segment.end === null || segment.end === undefined ? null : segment.end }); deck.el.currentTime = segment.start; }
+    else if (startAt > 0) deck.el.currentTime = startAt;
+    deck.from = deck.el.currentTime; // where it waits, for when a seam is called off
+    return true;
+  }
+  /** AUTOMIX: the standby starts when the playing deck reaches `plan.at` (file time) and the two overlap (mixPlan). */
+  armMix(plan) { if (this.standby) this.mix = plan; }
+  cancelPrepared() {
+    clearTimeout(this.seamTimer); this.seamTimer = null;
+    this.mix = null;
+    if (this.standby) { this.disposeDeck(this.standby); this.standby = null; }
+  }
+  get prepared() { return this.standby ? { url: this.standby.url, start: this.standby.start } : null; }
+  /** Seconds left of the playing deck's track: to its stretch's end (a cue track) or the file's. */
+  timeLeft() {
+    const d = this.deck;
+    if (!d) return Infinity;
+    const end = d.end !== null ? d.end : d.el.duration;
+    return Number.isFinite(end) ? end - d.el.currentTime : Infinity;
+  }
+  /** Seconds until the seam: to the armed mix's moment, else to the end. Below 0 once seeked past the mix's moment. */
+  seamLeft() { return this.mix && this.deck ? this.mix.at - this.deck.el.currentTime : this.timeLeft(); }
+  /** On the playback timer: near the end (or the mix) with a standby ready, a fine timer starts it on time (seam). */
+  watchSeam() {
+    if (!this.standby || this.seamTimer || !this.deck || this.deck.el.paused || this.fadingOut) return;
+    if (this.seamLeft() > SEAM_WATCH) return;
+    const outgoing = this.deck;
+    // Android's media clock moves in steps of 20–40 ms, and can go from some 30 ms before the end straight to the end:
+    // the seam's moment fell between two steps, and the song ended with a gap. Between steps, the wall clock carries the
+    // time on (at most a step's worth — a song stalled for data doesn't run on). Chromium's own clock is smooth: no change.
+    let seen = -1, seenAt = 0;
+    const leftNow = () => {
+      const t = outgoing.el.currentTime, now = performance.now();
+      if (t !== seen) { seen = t; seenAt = now; }
+      return this.seamLeft() - Math.min(SEAM_STEP, (now - seenAt) / 1000) * (outgoing.el.playbackRate || 1);
+    };
+    const check = () => {
+      this.seamTimer = null;
+      if (this.deck !== outgoing || !this.standby || outgoing.el.paused) return;
+      const left = leftNow();
+      if (left > SEAM_WATCH) return; // seeked away: the playback timer will come back to it
+      if (left > SEAM_LEAD) { this.seamTimer = setTimeout(check, 2); return; }
+      this.seam(outgoing, this.standby);
+    };
+    check();
+  }
+  async seam(outgoing, incoming) {
+    const mix = this.mix;
+    this.standby = null; this.mix = null;
+    // While the next one starts (some 10 ms), the old one's end isn't reported: it would load the next track a second
+    // time over the one starting. If it couldn't start, that end is reported now, late — the usual way on.
+    this.seaming = outgoing;
+    const endedMeanwhile = () => outgoing.el.ended || (outgoing.end !== null && outgoing.el.currentTime >= outgoing.end);
+    let started = true;
+    try { await incoming.el.play(); } catch { started = false; }
+    this.seaming = null;
+    if (!started || this.deck !== outgoing) {
+      // Couldn't start — or another song was put on meanwhile (NEXT, a click): this one goes.
+      this.disposeDeck(incoming);
+      if (!started && this.deck === outgoing && endedMeanwhile() && this.onEnded) this.onEnded(outgoing);
+      return;
+    }
+    if (outgoing.el.paused && !endedMeanwhile()) {
+      // Paused while the next one started: the pause wins. It waits on standby again for when the music plays on.
+      hush(incoming.el);
+      incoming.el.currentTime = incoming.from || 0;
+      this.standby = incoming; this.mix = mix;
+      return;
+    }
+    if (mix && mix.overlap > 0) this.startMix(outgoing, incoming, mix);
+    else {
+      const now = this.ctx.currentTime;
+      outgoing.gain.gain.cancelScheduledValues(now); incoming.gain.gain.cancelScheduledValues(now);
+      outgoing.gain.gain.setValueCurveAtTime(equalPower(false), now, SEAM_BLEND);
+      incoming.gain.gain.setValueCurveAtTime(equalPower(true), now, SEAM_BLEND);
+      setTimeout(() => this.disposeDeck(outgoing), 60);
+    }
+    this.deck = incoming;
+    if (this.onAdvance) this.onAdvance(incoming);
+  }
+  /**
+   * AUTOMIX's overlap: the outgoing deck is the one fadingOut until it's over (a manual load, stop or pause cuts it off,
+   * as a crossfade's). An ending fades out and loses its bass; a dead stop plays to its end as it is.
+   */
+  startMix(outgoing, incoming, { overlap, fadeIn, fadeOut, fadeFrom = 0 }) {
+    const now = this.ctx.currentTime, og = outgoing.gain.gain, ig = incoming.gain.gain;
+    og.cancelScheduledValues(now); ig.cancelScheduledValues(now);
+    ig.setValueCurveAtTime(equalPower(true, 64, fadeFrom), now, Math.max(SEAM_BLEND, fadeIn)); // (it may go on rising after the old one is gone)
+    if (fadeOut) {
+      // It has already died away (mixPlan comes in at its settle): it plays its own decay for the first half, so it's
+      // still there while the next one comes up — fading it from the start leaves a hole — and fades over the second.
+      og.setValueAtTime(og.value, now);
+      og.setValueCurveAtTime(equalPower(false), now + overlap / 2, overlap / 2);
+      const f = outgoing.filter && outgoing.filter.frequency;
+      if (f) { f.cancelScheduledValues(now); f.setValueAtTime(20, now); f.exponentialRampToValueAtTime(BASS_CUT_HZ, now + overlap / 2); }
+    } else {
+      og.setValueAtTime(og.value, now);
+      og.setValueCurveAtTime(equalPower(false), now + Math.max(0, overlap - 0.05), 0.05); // what's left is silence
+    }
+    this.fadingOut = outgoing;
+    this.setGuard(true);
+    this.fadeTimer = setTimeout(() => {
+      this.fadeTimer = null;
+      if (this.fadingOut === outgoing) { this.disposeDeck(outgoing); this.fadingOut = null; this.setGuard(false); }
+      if (this.onCrossfadeDone) this.onCrossfadeDone();
+    }, overlap * 1000 + 50);
+  }
+  /**
+   * The end of a stretch isn't the end of the file, so no 'ended' event comes: this is called on the playback
+   * timer and reports it — once, timed to the moment rather than the next tick when it's that close.
+   */
+  watchSegmentEnd() {
+    const deck = this.deck;
+    if (!deck || deck.end === null || deck.endFired || deck.el.paused) return;
+    const left = deck.end - deck.el.currentTime;
+    if (left > 0.06) return;
+    deck.endFired = true;
+    const fire = () => { if (this.deck === deck && deck !== this.seaming && this.onEnded) this.onEnded(deck); };
+    if (left > 0) setTimeout(fire, left * 1000); else fire();
+  }
+
+  async play() {
+    if (!this.deck) return;
+    this.deck.pausedFromOutside = false; // (played on from the player: not something to tell it about)
+    this.wake();
+    if (this.ctx.state !== 'running') await this.ctx.resume();
+    try { await this.deck.el.play(); } catch { /* interrupted by a newer load */ }
+  }
+  // A song still fading out (a crossfade, a mix) is let go of: it mustn't play on, unheard of, under a paused one.
+  pause() { if (this.fadingOut) this.cancelCrossfade(); if (this.deck) hush(this.deck.el); this.sleepSoon(); }
+  // Paused a few seconds, the songs are cut off from the EQ, spatial audio and meters, which would otherwise work
+  // through silence all the while (a third of what the paused player cost). The context itself keeps running: a
+  // suspended one stops the output, the Mac's speakers doze off, and the song came back a moment late after a pause.
+  // Anything that sounds wakes it (wake()).
+  sleepSoon(ms = 4000) {
+    clearTimeout(this.sleepTimer);
+    this.sleepTimer = setTimeout(() => {
+      const sounding = (this.deck && !this.deck.el.paused) || this.fadingOut;
+      if (!sounding && !this.asleep) { this.input.disconnect(this.eq[0]); this.asleep = true; }
+    }, ms);
+  }
+  wake() {
+    clearTimeout(this.sleepTimer);
+    if (this.asleep) { this.input.connect(this.eq[0]); this.asleep = false; }
+    if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+  }
+
+  /**
+   * A snatch of the song from where it is now — the way a CD player sounds while it searches — faded in and out over
+   * a few milliseconds so it doesn't click. Only for files: a Spotify track plays outside Web Audio.
+   */
+  async blip(ms = 70) {
+    const d = this.deck;
+    if (!d || !d.source) return;
+    clearTimeout(this.blipTimer);
+    const g = d.gain.gain, t = this.ctx.currentTime;
+    g.cancelScheduledValues(t); g.setValueAtTime(0, t); g.linearRampToValueAtTime(1, t + 0.008);
+    this.blipTimer = setTimeout(() => {
+      if (this.deck !== d) return;
+      g.setTargetAtTime(0, this.ctx.currentTime, 0.005);
+      this.blipTimer = setTimeout(() => { if (this.deck === d) hush(d.el); }, 25);
+    }, ms);
+    if (d.el.paused) await this.play();
+  }
+  /** Done searching: quiet, and the track back at full level for when it plays on. */
+  endBlips() {
+    clearTimeout(this.blipTimer); this.blipTimer = null;
+    const d = this.deck;
+    if (!d) return;
+    hush(d.el);
+    d.gain.gain.cancelScheduledValues(this.ctx.currentTime);
+    d.gain.gain.value = 1;
+  }
+  stop() { this.cancelPrepared(); this.cancelCrossfade(); this.disposeDeck(this.deck); this.deck = null; }
+  get playing() { return !!this.deck && !this.deck.el.paused && !this.deck.el.ended; }
+  /** How long sound takes from here to the speakers (seconds): the output's latency, re-read as the device changes. */
+  get outputLatency() { return (this.ctx && (this.ctx.outputLatency || this.ctx.baseLatency)) || 0; }
+  get position() {
+    if (!this.deck) return 0;
+    const p = (this.deck.el.currentTime || 0) - this.deck.start;
+    return Math.max(0, this.deck.end === null ? p : Math.min(this.duration, p));
+  }
+  get duration() {
+    if (!this.deck) return 0;
+    const file = Number.isFinite(this.deck.el.duration) ? this.deck.el.duration : 0;
+    const end = this.deck.end === null ? file : file ? Math.min(file, this.deck.end) : this.deck.end;
+    return Math.max(0, end - this.deck.start);
+  }
+  seek(seconds) {
+    const d = this.deck;
+    if (!d) return;
+    const target = Math.max(0, Math.min(this.duration || 0, seconds));
+    d.el.currentTime = d.start + target;
+    if (d.end === null || d.start + target < d.end - 0.06) d.endFired = false;
+  }
+
+  /**
+   * Visualizer levels: the last ~90ms of output split into `bars` consecutive slices, each slice's RMS scaled by
+   * 3.4 — the same broadband loudness measure the Java version computed from raw PCM.
+   */
+  levels(bars = 5, windowMs = 90) {
+    if (!this.playing) return null;
+    this.analyser.getFloatTimeDomainData(this.samples);
+    const windowFrames = Math.min(this.samples.length, Math.max(bars, Math.round(this.ctx.sampleRate * windowMs / 1000)));
+    const start = this.samples.length - windowFrames, per = Math.max(1, Math.floor(windowFrames / bars));
+    const out = new Array(bars);
+    for (let b = 0; b < bars; b++) {
+      let sum = 0;
+      for (let i = start + b * per, end = Math.min(this.samples.length, i + per); i < end; i++) sum += this.samples[i] * this.samples[i];
+      out[b] = Math.min(1, Math.sqrt(sum / per) * 3.4);
+    }
+    return out;
+  }
+
+  /** How loud each side is now — the RMS of its last ~45 ms, scaled as levels() — → [left, right], or null paused. */
+  stereo() {
+    if (!this.playing) return null;
+    if (!this.sideSamples) this.sideSamples = new Float32Array(2048);
+    return this.sides.map((a) => {
+      a.getFloatTimeDomainData(this.sideSamples);
+      let sum = 0;
+      for (const v of this.sideSamples) sum += v * v;
+      return Math.min(1, Math.sqrt(sum / this.sideSamples.length) * 3.4);
+    });
+  }
+
+  /**
+   * Visualizer Mode's spectrum: `count` bands spaced evenly in pitch (log-spaced) from 40 Hz to 16 kHz, each 0–1.
+   * A band's loudness is its average power, tilted up 3 dB per octave above 1 kHz (music gets quieter towards the
+   * treble, so without it the right half would barely move), mapped from −78…−18 dB.
+   */
+  /**
+   * What's playing as a MediaStream, to record (the card's video); stopRecording() lets go of it. Hi-res (above
+   * 48 kHz, played at the file's own rate) comes through a 48 kHz context: the recorder's AAC can't start at more.
+   */
+  recordingStream() {
+    if (!this.recDest) this.recDest = this.ctx.createMediaStreamDestination();
+    this.out.connect(this.recDest);
+    if (this.ctx.sampleRate <= 48000) return this.recDest.stream;
+    // A new one each time: one suspended and resumed for the next video records a second of it, without sound.
+    this.closeRecordingContext();
+    this.recCtx = new AudioContext({ sampleRate: 48000 });
+    const out = this.recCtx.createMediaStreamDestination();
+    this.recCtx.createMediaStreamSource(this.recDest.stream).connect(out);
+    return out.stream;
+  }
+  stopRecording() {
+    if (this.recDest) try { this.out.disconnect(this.recDest); } catch { /* not connected */ }
+    this.closeRecordingContext();
+  }
+  closeRecordingContext() { if (this.recCtx) this.recCtx.close().catch(() => {}); this.recCtx = null; }
+  /** Plays through the output device `id` ('' for the system default), without a pause. → false if it can't. */
+  async setOutput(id) {
+    if (!this.ctx.setSinkId) return false;
+    try { await this.ctx.setSinkId(id || ''); this.outputId = id || ''; return true; } catch { return false; }
+  }
+  spectrum(count) {
+    if (!this.playing) return null;
+    const bins = this.analyser.frequencyBinCount;
+    if (!this.freq || this.freq.length !== bins) this.freq = new Float32Array(bins);
+    this.analyser.getFloatFrequencyData(this.freq);
+    const nyquist = this.ctx.sampleRate / 2, lo = 40, hi = 16000, out = new Array(count);
+    for (let b = 0; b < count; b++) {
+      const f0 = lo * Math.pow(hi / lo, b / count), f1 = lo * Math.pow(hi / lo, (b + 1) / count);
+      const i0 = Math.min(bins - 1, Math.floor((f0 / nyquist) * bins)), i1 = Math.min(bins, Math.max(i0 + 1, Math.ceil((f1 / nyquist) * bins)));
+      let power = 0;
+      for (let i = i0; i < i1; i++) power += Math.pow(10, this.freq[i] / 10);
+      const db = 10 * Math.log10(power / (i1 - i0) + 1e-20) + Math.max(0, 3 * Math.log2(Math.sqrt(f0 * f1) / 1000));
+      out[b] = Math.max(0, Math.min(1, (db + 78) / 60));
+    }
+    return out;
+  }
+
+  /**
+   * The seek bar's waveform: 220 buckets of RMS amplitude, normalized to the loudest bucket — and, from the same
+   * decode, each 100 ms block's power over every channel, for finding a hidden track (hidden-track.js).
+   * → { buckets, power }.
+   */
+  async computeWaveform(url, buckets = 220) {
+    const res = await fetch(url);
+    const buf = await res.arrayBuffer();
+    // Decoded at a low sample rate — plenty for an amplitude outline, and a fraction of the memory.
+    const decoded = await new OfflineAudioContext(1, 1, 8000).decodeAudioData(buf);
+    const channels = Array.from({ length: decoded.numberOfChannels }, (_, i) => decoded.getChannelData(i));
+    const power = powerEnvelope(channels, decoded.sampleRate);
+    const data = channels[0];
+    const per = Math.max(1, Math.floor(data.length / buckets));
+    const rms = new Float32Array(buckets);
+    let peak = 0;
+    for (let b = 0; b < buckets; b++) {
+      let sum = 0, count = 0;
+      for (let i = b * per, end = Math.min(data.length, i + per); i < end; i++) { sum += data[i] * data[i]; count++; }
+      rms[b] = count ? Math.sqrt(sum / count) : 0;
+      if (rms[b] > peak) peak = rms[b];
+    }
+    if (peak > 0) for (let b = 0; b < buckets; b++) rms[b] = Math.min(1, rms[b] / peak);
+    return { buckets: rms, power };
+  }
+}

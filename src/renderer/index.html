@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self' https://sdk.scdn.co; frame-src https://sdk.scdn.co; connect-src 'self'">
+  <title>CDPlayer</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="js/first-paint.js"></script>
+</head>
+<body class="booting">
+  <div id="backdrop"><img id="backdrop-theme" alt=""><canvas id="backdrop-art"></canvas><div id="backdrop-flow"><i></i><i></i><i></i><i></i></div></div>
+  <canvas id="look-visualizer"></canvas>
+
+  <main id="main">
+    <div id="header-block">
+      <header id="header">
+        <div id="header-west">
+          <button class="pill" id="update-button" hidden></button>
+          <button class="pill" id="phone-tag" hidden data-i18n>PHONE</button>
+          <button class="pill" id="cd-button" title="Play the audio CD in your drive" hidden data-i18n-title data-i18n>AUDIO CD</button>
+          <button class="pill" id="rip-button" title="Save this CD into your music folder as FLAC" hidden data-i18n-title data-i18n>RIP</button>
+        </div>
+        <div id="status-pill"><span id="status">●&nbsp;&nbsp;READY TO PLAY</span></div>
+        <div id="header-east">
+          <span id="sleep-indicator" title="Click to cancel the sleep timer" data-i18n-title></span>
+          <button class="pill" id="shelf-button" title="Your albums on a shelf (S)" data-i18n-title data-i18n>SHELF</button>
+          <button class="pill" id="spotify-button" title="Play albums and playlists from your Spotify (Premium)" data-i18n-title data-i18n>SPOTIFY</button>
+          <button class="pill" id="history-button" data-i18n>HISTORY</button>
+          <button class="pill" id="cd-view-button" title="Distraction-free view: just the disc" data-i18n-title data-i18n>CD VIEW</button>
+          <button class="pill" id="queue-toggle" title="The queue and the changer, at the side (PLAYER LOOK: VISUALIZER and LYRICS)" data-i18n-title data-i18n>QUEUE</button>
+          <button class="pill" id="more-button" title="More: what the PLAYER LOOK leaves out of the header, with its keys" data-i18n-title>⋯</button>
+          <button class="pill" id="settings-button" data-i18n>SETTINGS</button>
+        </div>
+      </header>
+      <canvas id="divider"></canvas>
+    </div>
+
+    <div id="body">
+      <div id="disc-column"><canvas id="disc"></canvas><div id="case-box"><div id="case-tray"><div class="tray-plastic"></div></div><div id="album-disc"></div><div id="cover-art"><div class="lid-inside"></div></div></div></div>
+      <section id="player">
+        <div id="faceplate">
+          <div id="now-row">
+            <span id="now-playing-label" data-i18n>NOW PLAYING</span>
+            <canvas id="visualizer"></canvas>
+            <span class="grow"></span>
+            <button class="pill" id="karaoke-button" title="Karaoke: the lyrics fill in word by word as they're sung (Y)" hidden data-i18n-title data-i18n>KARAOKE</button>
+            <button class="pill" id="lyrics-button" hidden data-i18n>LYRICS</button>
+            <button class="pill" id="tags-button" title="See and fix this song's tags — from MusicBrainz, or by hand" hidden data-i18n-title data-i18n>TAGS</button>
+          </div>
+          <div id="track-title" class="fit" data-i18n>Pick a track to get started.</div>
+          <div id="track-artist" class="fit" hidden></div>
+          <div id="source-row"><span id="hidden-badge" hidden data-i18n>HIDDEN</span><span id="quality-badge" hidden></span><span id="soundcheck-badge" hidden></span><div id="track-source" data-i18n>YOUR MUSIC LIBRARY</div></div>
+          <canvas id="vu-meters"></canvas>
+          <div id="progress-row"></div>
+          <div id="deck-display">
+            <div class="vfd-track"><span class="vfd-label"><span data-i18n>TRACK</span><span id="vfd-disc" class="vfd-disc" hidden></span></span><div class="vfd-digits"><canvas id="vfd-track" data-h="26"></canvas><span id="vfd-of"></span></div></div>
+            <div class="vfd-flags"><span class="vfd-flag" data-flag="play" data-i18n>PLAY|display</span><span class="vfd-flag" data-flag="pause" data-i18n>PAUSE|display</span><span class="vfd-flag" data-flag="shuffle" data-i18n>SHUFFLE|display</span><span class="vfd-flag" data-flag="repeat" data-i18n>REPEAT|display</span><span class="vfd-flag" data-flag="one">1</span><span id="vfd-say"></span></div>
+            <canvas id="vfd-pet" title="BLIP. Double-click: its card" data-i18n-title></canvas>
+            <div class="vfd-time" id="vfd-time-button" title="Click: the time left in the song, or how far in it is" data-i18n-title><span id="vfd-total" class="vfd-label"><span data-i18n>TOTAL|display</span><span> --:--</span></span><canvas id="vfd-time" data-h="26"></canvas></div>
+            <span class="vfd-flag" data-flag="net" title="Streamed: the sound comes over the internet" data-i18n-title data-i18n>NET|display</span>
+          </div>
+          <div id="times"><span id="elapsed">0:00</span><span id="length" title="Click: the time left in the song, or its length" data-i18n-title>0:00</span></div>
+          <div id="controls"><div id="transport"></div></div>
+          <div id="volume-row" class="slider-row">
+            <span class="row-label" data-i18n>VOLUME</span>
+            <div id="volume-slider"></div>
+            <span class="row-value" id="volume-value">100%</span>
+            <span class="grow"></span>
+            <button class="pill small" id="tray-button" title="Open / close the disc tray (E)" data-i18n-title>⏏</button>
+            <button class="pill" id="load-button" data-i18n>LOAD A TRACK&nbsp;&nbsp;+</button>
+          </div>
+        </div>
+        <div id="queue-card">
+          <div id="album-head"><div id="album-name"></div><div id="album-artist"></div><div id="album-line"></div></div>
+          <div id="queue-head">
+            <div id="queue-text">
+              <div id="queue-info" data-i18n>CHANGER EMPTY</div>
+              <div id="queue-next" data-i18n>OPEN THE SHELF (S) AND PICK AN ALBUM — OR DROP SONGS HERE</div>
+            </div>
+            <div id="queue-actions">
+              <button class="pill small" id="search-button" title="Search your music folder, or paste a Spotify track/playlist link" data-i18n-title data-i18n>SEARCH</button>
+              <button class="pill small" id="save-playlist-button" title="Save the playing disc as a .m3u playlist file" data-i18n-title data-i18n>SAVE</button>
+              <button class="pill small" id="load-playlist-button" title="Load a .m3u playlist file as a CD-R" data-i18n-title data-i18n>LOAD</button>
+              <button class="pill small" id="disc-skip-button" title="Next disc (D)" data-i18n-title data-i18n>DISC SKIP</button>
+              <button class="pill small" id="eject-disc-button" title="Take the playing disc out of the changer" data-i18n-title data-i18n>EJECT</button>
+              <button class="pill small" id="clear-queue-button" data-i18n>CLEAR</button>
+            </div>
+          </div>
+          <div id="changer-row">
+            <div id="changer"></div>
+            <div id="disc-side">
+              <div id="disc-heading"></div>
+              <div id="queue-list" class="scroll"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <div id="look-lyrics"></div>
+      <canvas id="look-terminal"></canvas>
+    </div>
+
+    <footer id="south">
+      <div id="hint"><span id="hint-keys"><span data-i18n>SPACE PLAY · J/L PREV/NEXT TRACK · S SHELF · E TRAY · B TURN OVER · C CD VIEW · Y KARAOKE</span> · </span><b data-i18n>? ALL KEYS</b></div>
+      <div id="cd-info" hidden>
+        <div id="cd-title" class="fit"></div>
+        <div id="cd-artist" class="fit" hidden></div>
+        <div id="cd-exit" data-i18n>C OR ESC — BACK TO THE PLAYER</div>
+      </div>
+    </footer>
+  </main>
+
+  <div id="vis-mode" hidden>
+    <canvas id="big-visualizer"></canvas>
+    <div class="vis-hint" data-i18n>MOVE THE MOUSE, OR PRESS V / ESC, TO EXIT</div>
+  </div>
+
+  <div id="karaoke" hidden>
+    <div id="karaoke-actions">
+      <button class="pill small" id="karaoke-roman" title="Show how the words sound, in English letters" hidden data-i18n-title data-i18n>ABC</button>
+      <button class="pill small" id="karaoke-close" title="Back to the player (Y or Esc)" data-i18n-title data-i18n>CLOSE</button>
+    </div>
+    <div id="karaoke-cover"></div>
+    <div id="karaoke-title"></div>
+    <div id="karaoke-note" hidden></div>
+    <div id="karaoke-stage"><div id="karaoke-lines"></div></div>
+    <div class="vis-hint" data-i18n>CLICK A LINE TO JUMP TO IT · PRESS Y OR ESC TO EXIT</div>
+  </div>
+
+  <div id="shelf" hidden>
+    <div id="shelf-head">
+      <div id="shelf-heading"><div id="shelf-title" data-i18n>THE SHELF</div><div id="shelf-count"></div></div>
+      <span class="grow"></span>
+      <input id="shelf-filter" class="text-input" placeholder="Find an album or artist" spellcheck="false" data-i18n-placeholder>
+      <button class="pill small" id="shelf-here" title="Go to the album that's in the player" hidden data-i18n-title>⌖</button>
+      <button class="pill small" id="shelf-share" title="A picture of your shelf as it stands — the albums shown, as they're sorted — to copy or save" data-i18n-title data-i18n>SHARE</button>
+      <button class="pill small" id="shelf-check" title="Look for problems in your music folder: missing tags and covers, duplicates, gaps" data-i18n-title data-i18n>CHECK</button>
+      <button class="pill small" id="shelf-year" title="Your year of listening: hours, the albums and artists played most, month by month" data-i18n-title data-i18n>THE YEAR</button>
+      <button class="pill small" id="shelf-pull" title="Take an album off the shelf at random — the dustier, the likelier" data-i18n-title data-i18n>PULL ONE</button>
+      <button class="pill small" id="shelf-take" title="Copy the albums shown to a portable player, a phone or an SD card — as they are, or as MP3s" data-i18n-title data-i18n>TAKE ALONG</button>
+      <button class="pill small" id="shelf-fill" title="Fill the changer with albums at random from the ones shown, the dustier the likelier — now, or each time a disc is played to its end" hidden data-i18n-title data-i18n>FILL</button>
+      <button class="pill small" id="shelf-appraise" title="What your albums are worth on Discogs: the lowest price of each" data-i18n-title data-i18n>APPRAISE</button>
+      <button class="pill small" id="shelf-want" title="Albums you don't have yet and want, each with its lowest price on Discogs — put on it with ★ WANT from a missing album's case" data-i18n-title data-i18n>WANT LIST</button>
+      <button class="pill small" id="shelf-show" title="Which albums stand on the shelf — all, or only some: dusty, still wrapped, left part-way, a decade, a genre…" data-i18n-title data-i18n>SHOW: ALL</button>
+      <button class="pill small" id="shelf-sort" title="How the shelf is sorted — click to pick another way" data-i18n-title data-i18n>SORT: ARTIST</button>
+      <button class="pill small" id="shelf-folder" title="The folders your music is in — add another (an external drive, say) or choose a different one" data-i18n-title data-i18n>FOLDER…</button>
+      <button class="pill small" id="shelf-close" data-i18n>CLOSE</button>
+    </div>
+    <div id="shelf-body" class="scroll"></div>
+    <nav id="shelf-index" aria-label="Jump to a section"></nav>
+  </div>
+
+  <div id="overlays"></div>
+  <canvas id="particles"></canvas>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

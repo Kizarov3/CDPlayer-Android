@@ -1,0 +1,1469 @@
+// The CD shelf (S, or SHELF): every album in your music folder as a jewel case standing on a shelf, spine out — the
+// spine in the colours of its cover, a double album twice as thick. Click one and the case slides out and turns to
+// show its front: the cover, the tracklist, and PLAY, which puts it in the player (the tray comes out, the disc goes
+// in, the tray closes and it plays). Click the case's cover and the album's booklet lifts out of it. Or pick a spine up
+// and carry it out: the shelf fades so the player shows through, and it goes in on the disc or at the end of the queue
+// (with ⇧ held, to play next). An album left unplayed gathers dust (shelf-dust.js): rub the mouse over its spine to
+// wipe it. PULL ONE takes one off the shelf at random, the dustier the likelier. A case can have a sticky note on it
+// (shelf-notes.js), whose corner shows above its spine. A new album comes in shrink-wrap until it's played or
+// unwrapped by hand, dragging the film off its case. A missing album's ghost case puts it on the WANT LIST (★ WANT;
+// want-list.js); when it turns up in the music folder it's crossed off, and its case says FOUND IT until it's played.
+import { el, pill, anim, EASE, growFrom, swingLid } from './widgets.js';
+import { labelImage, printedDisc } from './disc.js';
+import { openBooklet, closeBooklet, albumBooklet, isBookletOpen } from './booklet.js';
+import { stickersFor } from './shelf-stickers.js';
+import { todaySticker, todayLine, pullToday } from './on-this-day.js';
+import { arrange, SORTS, matchesFilter, dominantColor, jumpTargets, shelfSignature } from './shelf-order.js';
+import { pressingLine, marketLine, money, isRare, shelfTotal, discogsPrice } from './shelf-discogs.js';
+import { hash } from './disc-wear.js';
+import { stickyNote, noteLook } from './shelf-notes.js';
+import { receiptFor } from './shelf-receipt.js';
+import { withMissing, boxLabel, sameName, boxesFor, renderGate, groupFor, pickEdition, fullTracklist } from './shelf-missing.js';
+import { dustLevel, pickOne, pickSome, Wiper } from './shelf-dust.js';
+import { showsAlbum, showChoices } from './shelf-show.js';
+import { groupEditions, editionName } from './shelf-editions.js';
+import { similarOnShelf, similarPool, createSimilarLookup } from './similar-shelf.js';
+import { SLOTS, slotOfAlbum } from './changer.js';
+import { isWanted, wantKey, stillWanted, foundNote } from './want-list.js';
+import { ROW, ROW_ABOVE, ROW_BELOW, shelfieCrops, shelfieLine, completeCount } from './shelfie.js';
+import { t, locale } from './i18n.js';
+import { shown as theme } from './theme.js';
+import { caseKind, discRuns, withDiscHeads } from './box-set.js';
+
+const $ = (id) => document.getElementById(id);
+const shelf = { open: false, albums: [], loading: false, covers: new Map(), colors: new Map(), observer: null, caseOpen: null, app: null, generation: 0, inPlayer: null,
+  discogs: new Map(), openBoxes: new Set(), pressings: new Map(), appraising: null, appraisalNote: null, countBase: '', settings: null, noCover: new Set(), colorCache: {}, hidden: new Set(), moves: [], show: 'ALL', showLabel: null, boxObserver: null, wantTimer: null, onScreen: new Set(), wanted: [] };
+
+export const isShelfOpen = () => shelf.open;
+// Discographies arriving redraw the shelf — once for a burst, and not while a case is out, a spine is carried or one
+// is about to be pulled out (a redraw would take the shelf out from under them).
+// The music folder changed (library-watch.js): the shelf, if it's open, reads it again quietly — once the case,
+// booklet or spine in hand is put back, and after a load that's already running.
+const refresh = renderGate({
+  render: () => { if (shelf.open) load({ quiet: true }); },
+  busy: () => shelf.loading || !!shelf.caseOpen || isBookletOpen() || shelf.pulling || $('shelf').classList.contains('carrying'),
+});
+const redraw = renderGate({ render: () => { if (shelf.open) render(); }, busy: () => !!shelf.caseOpen || shelf.pulling || $('shelf').classList.contains('carrying') });
+
+// The album whose disc is in the player (a track of it loaded, playing or paused) stands a little proud of the others,
+// lit in the theme's colour.
+const IN_PLAYER = t('IN THE PLAYER');
+const SORT_LABELS = { ARTIST: t('ARTIST'), NEW: t('NEW|sort'), PLAYED: t('MOST PLAYED'), RECENT: t('LAST PLAYED'), YEAR: t('YEAR'), COLOR: t('COLOR'), PRICE: t('PRICE'), MINE: t('MY DIVIDERS') };
+const holds = (a, path) => !!path && a.tracks.some((t) => t.path === path);
+// An album and the editions behind its spine (shelf-editions.js): what the spine shows is any of theirs.
+const group = (a) => a.editions || [a];
+const spineHolds = (a, path) => group(a).some((e) => holds(e, path));
+const noteOf = (a) => (group(a).find((e) => e.note) || {}).note || null;
+const bookmarkOf = (a) => group(a).some((e) => e.bookmark);
+// ON THIS DAY (on-this-day.js): the sticker today puts on the spine — any of its editions'.
+const todayOf = (a, now = Date.now()) => group(a).map((e) => todaySticker(e, now)).find(Boolean) || null;
+const spineTitle = (a) => [a.artist, a.title, a.year, spineHolds(a, shelf.inPlayer) ? IN_PLAYER : null].filter(Boolean).join(' · ')
+  + (a.editions ? `\n${t('{n} EDITIONS', { n: a.editions.length })}` : '')
+  + (todayOf(a) ? `\n${todayOf(a).label}` : '')
+  + (group(a).some((e) => e.bookmark) ? `\n${leftAt(group(a).find((e) => e.bookmark))}` : '') + (noteOf(a) ? `\n\n${noteOf(a)}` : '');
+// Where an album played from its start was left (album-runs.js): its bookmark's words.
+const leftAt = (a) => t('Left at track {n} · {song}', { n: a.bookmark.track + 1, song: (a.tracks[a.bookmark.track] || {}).title || '' });
+/** The track now in the player (null: none), so its album's spine can show it. */
+// Artists like an album's, as Last.fm has them (main/similar-artists.js): asked once each while CDPlayer runs.
+const similar = createSimilarLookup((artist) => shelf.app.cdp.similarArtists(artist));
+// A shelf album as a changer disc: the shelf's own album id, so loading it again is ALREADY IN SLOT n.
+// A double album or a box set brings its `parts` too, a disc each, for the changer's slots side by side (loadSet).
+const discOfAlbum = (a) => {
+  const runs = a.discs > 1 ? discRuns(a.tracks) : [];
+  return { id: a.id, kind: 'album', title: a.title, artist: a.artist,
+    parts: runs.length > 1 ? runs.map((r) => ({ disc: { id: `${a.id}#${r.no}`, kind: 'album', title: t('{title} · CD {n}', { title: a.title, n: r.no }), artist: a.artist }, tracks: r.tracks.map((x) => x.path) })) : null };
+};
+// The changer slot number on the spine of an album that's in the changer.
+function markSlot(spine) {
+  const c = shelf.app && shelf.app.changerMode && shelf.app.changerMode() ? shelf.app.changerState() : null;
+  const slot = c ? group(spine.album).map((e) => slotOfAlbum(c, e)).find((s) => s >= 0) ?? -1 : -1;
+  let badge = spine.querySelector('.spine-slot');
+  if (slot < 0) { if (badge) badge.remove(); return; }
+  if (!badge) { badge = el('span', { class: 'spine-slot' }); spine.append(badge); }
+  badge.textContent = String(slot + 1);
+  badge.title = t('In the changer, slot {n}', { n: slot + 1 });
+}
+/** The changer changed: the slot numbers on the spines again. */
+export function showChangerSlots() {
+  if (!shelf.open) return;
+  for (const spine of document.querySelectorAll('#shelf-body .spine')) if (spine.album) markSlot(spine);
+}
+
+export function showInPlayer(path) {
+  shelf.inPlayer = path || null;
+  for (const spine of document.querySelectorAll('#shelf-body .spine')) {
+    if (!spine.album) continue; // a missing album's place
+    spine.classList.toggle('in-player', spineHolds(spine.album, shelf.inPlayer));
+    spine.title = spineTitle(spine.album);
+  }
+  if (shelf.open) showHere();
+}
+
+export async function openShelf(app) {
+  if (shelf.open) return;
+  shelf.app = app;
+  shelf.open = true;
+  const root = $('shelf');
+  root.hidden = false;
+  root.getAnimations().forEach((a) => a.cancel()); // (its going, if it's opened again before it's gone)
+  // (out of the SHELF button, as the panels come out of theirs; then the albums go up on it one after another)
+  const from = anim.enabled && shownButton();
+  if (from) growFrom(root, from, false, { open: 420 });
+  else if (anim.enabled) root.animate([{ opacity: 0, transform: 'translateY(18px)' }, { opacity: 1, transform: 'none' }], { duration: 260, easing: EASE.out });
+  $('shelf-filter').value = '';
+  await load();
+  if (anim.enabled && shelf.open) shelveIn();
+}
+const shownButton = () => { const b = $('shelf-button'); return b && b.offsetParent ? b : null; };
+// The spines in sight rise onto the shelf a moment apart, from the left (those out of sight just are there).
+function shelveIn() {
+  const box = $('shelf-body').getBoundingClientRect();
+  const seen = [...document.querySelectorAll('#shelf-body .spine, #shelf-body .missing-box')].filter((sp) => {
+    const r = sp.getBoundingClientRect();
+    return r.bottom > box.top && r.top < box.bottom && r.right > box.left && r.left < box.right;
+  }).slice(0, 60);
+  seen.forEach((sp, i) => sp.animate([{ opacity: 0, transform: 'translateY(22px)' }, { opacity: 1, transform: 'none' }],
+    { duration: 300, delay: Math.min(i * 12, 420), easing: EASE.out, fill: 'backwards' }));
+}
+
+/**
+ * WHAT'S SPECIAL's SHOW ME, on the shelf: it opens, and the thing is pointed at — the dustiest spine ('dust'), a
+ * shrink-wrapped one ('wrap'), an artist's box of albums you don't have, opened ('missing'), or a case pulled out with
+ * its Discogs pressing ('discogs'). When there's none to show, the shelf's line says why.
+ */
+export async function shelfShowMe(app, what) {
+  if (!shelf.open) await openShelf(app);
+  for (let i = 0; i < 40 && (shelf.loading || !document.querySelector('#shelf-body .spine')); i++) await new Promise((r) => setTimeout(r, 100));
+  const spines = [...document.querySelectorAll('#shelf-body .spine')].filter((sp) => sp.album);
+  const point = (node) => {
+    node.scrollIntoView({ block: 'center', inline: 'center', behavior: anim.enabled ? 'smooth' : 'auto' });
+    node.classList.remove('show-me'); void node.offsetWidth; node.classList.add('show-me');
+    setTimeout(() => node.classList.remove('show-me'), 3200);
+  };
+  if (what === 'dust') {
+    const dusty = spines.filter((sp) => sp.dust > 0).sort((a, b) => b.dust - a.dust)[0];
+    if (dusty) point(dusty); else say(t('NO DUST YET · IT GATHERS ON AN ALBUM NOT PLAYED FOR A MONTH'));
+  } else if (what === 'wrap') {
+    const wrapped = spines.find((sp) => sp.classList.contains('new'));
+    if (wrapped) point(wrapped); else say(t('NOTHING NEW IN YOUR MUSIC FOLDER LATELY'));
+  } else if (what === 'missing') {
+    if (shelf.app.state.shelfSort !== 'ARTIST') { shelf.app.setShelfSort('ARTIST'); render(); await new Promise((r) => setTimeout(r, 300)); }
+    // The first artist whose missing albums are known; the box opens, and the places come out beside it.
+    for (let i = 0; i < 30; i++) {
+      const box = [...document.querySelectorAll('#shelf-body .missing-box')].find((b) => b.box && b.box.state === 'found' && b.box.missing.length);
+      if (box) {
+        if (!box.box.open) { shelf.openBoxes.add(box.box.key); render(); }
+        const again = [...document.querySelectorAll('#shelf-body .missing-box')].find((b) => b.box && b.box.key === box.box.key);
+        if (again) point(again);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    say(t('LOOKING UP YOUR ARTISTS ON MUSICBRAINZ · TRY AGAIN IN A MOMENT'));
+  } else if (what === 'discogs') {
+    const priced = spines.find((sp) => sp.album.pressing && sp.album.pressing.price && typeof sp.album.pressing.price.lowest === 'number') || spines[0];
+    if (priced) { point(priced); setTimeout(() => { if (shelf.open && !shelf.caseOpen) openCase(priced.album, priced); }, anim.enabled ? 700 : 0); }
+  }
+}
+
+export function closeShelf() {
+  if (!shelf.open) return;
+  closeBooklet(); // an album's booklet, open over its case
+  closeCase(true);
+  shelf.open = false;
+  shelf.openBoxes.clear();
+  stopLookups();
+  const root = $('shelf');
+  const back = anim.enabled ? shownButton() : null;
+  const going = back ? growFrom(root, back, true, { close: 240 }) : anim.enabled ? root.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(10px)' }], { duration: 180, easing: EASE.in }) : null;
+  if (!going) { root.hidden = true; return; }
+  going.onfinish = () => { if (!shelf.open) { root.hidden = true; root.getAnimations().forEach((a) => a.cancel()); } };
+}
+
+/** Esc: the open case first, then the shelf. → true when something closed. */
+export function escapeShelf() {
+  if (shelf.caseOpen) { closeCase(); return true; }
+  if (shelf.open) { closeShelf(); return true; }
+  return false;
+}
+
+export function setupShelf(app) {
+  shelf.app = app;
+  $('shelf-close').addEventListener('click', closeShelf);
+  $('shelf-folder').addEventListener('click', folderMenu);
+  $('shelf-pull').addEventListener('click', pullOne);
+  $('shelf-take').addEventListener('click', () => shelf.app.takeAlong());
+  $('shelf-year').addEventListener('click', () => shelf.app.showYear());
+  $('shelf-fill').addEventListener('click', fillChanger);
+  $('shelf-here').addEventListener('click', goToPlayer);
+  $('shelf-check').addEventListener('click', () => shelf.app.libraryCheck());
+  $('shelf-want').addEventListener('click', () => shelf.app.showWantList());
+  // Wanted albums that turned up in the music folder: said (the shelf, if it's open, reads the folder again by itself).
+  app.cdp.onWantFound((found) => { if (shelf.open) say(foundNote(found)); else app.setStatus(foundNote(found)); });
+  $('shelf-share').addEventListener('click', () => shelf.app.shareShelf());
+  $('shelf-filter').addEventListener('input', render);
+  // SORT: every way at once, in a list under the button — one click to any of them, the current one marked.
+  const sortBy = (sort) => {
+    shelf.app.setShelfSort(sort);
+    // (Prices to sort by: the shelf is appraised for them — unless the user stopped an appraisal; then by what's known.)
+    if (sort === 'PRICE' && !shelf.appraised && !shelf.appraisalStopped && !(shelf.appraising && !shelf.appraising.finished)) appraise();
+    render();
+    $('shelf-body').scrollTop = 0;
+  };
+  $('shelf-show').addEventListener('click', showMenu);
+  $('shelf-sort').addEventListener('click', () => shelf.app.menu($('shelf-sort'), SORTS.map((sort) => ({
+    label: SORT_LABELS[sort], current: sort === shelf.app.state.shelfSort, pick: () => { if (sort !== shelf.app.state.shelfSort) sortBy(sort); },
+  }))));
+  app.cdp.onDiscography(({ key, state, groups }) => {
+    shelf.discogs.set(key, { state, groups });
+    if (shelf.open && shelf.app.state.shelfSort === 'ARTIST') redraw.request();
+  });
+  $('shelf-appraise').addEventListener('click', () => {
+    if (shelf.appraising && !shelf.appraising.finished) { shelf.appraising.stopping = true; shelf.appraisalStopped = true; app.cdp.discogsStop(); updateAppraiseCount(); } else { shelf.appraisalStopped = false; appraise(); }
+  });
+  // Each album as the appraisal reaches it: its spine (and the shelf, sorted by price) brought up to date.
+  app.cdp.onDiscogsProgress((p) => {
+    if (p.entry) { shelf.pressings.set(p.albumId, p.entry); attachPressings(); }
+    if (p.waiting) { if (shelf.appraising && !shelf.appraising.finished) { shelf.appraisalNote = t('WAITING FOR DISCOGS…'); renderCount(); } return; }
+    // (the last of these can arrive after the appraisal's own answer: it mustn't make a finished one look running)
+    if (!shelf.appraising || !shelf.appraising.finished) { shelf.appraising = { ...shelf.appraising, done: p.done, total: p.total }; updateAppraiseCount(); }
+    if (shelf.open && shelf.app.state.shelfSort === 'PRICE') redraw.request(); else markSpine(p.albumId);
+  });
+  app.cdp.onLibraryChanged(() => { if (shelf.open) refresh.request(); });
+  app.cdp.onShelfProgress(({ done, total }) => { if (shelf.loading && !shelf.quietLoad) $('shelf-count').textContent = t('READING YOUR MUSIC · {done} / {total}', { done, total }); });
+}
+
+async function pickFolder(mode = 'replace') {
+  const folder = await shelf.app.cdp.pickMusicFolder(mode);
+  if (folder) await load();
+}
+// FOLDER…: the folders the shelf reads (a click shows one in Finder / Explorer), another one added — an external
+// drive, say — the one there is swapped for another, or one of several taken off the shelf (its files stay as they are).
+async function folderMenu() {
+  const folders = await shelf.app.cdp.musicFolders().catch(() => []);
+  if (!folders.length) { pickFolder(); return; }
+  shelf.app.menu($('shelf-folder'), [
+    ...folders.map((f) => ({ label: f.there ? `“${f.name}”` : t('“{name}” · NOT CONNECTED', { name: f.name }), current: folders.length > 1 && f.there, pick: () => { if (f.there) shelf.app.cdp.showFile(f.path); } })),
+    { divider: true },
+    { label: t('ADD ANOTHER FOLDER…'), pick: () => pickFolder('add') },
+    ...(folders.length === 1 ? [{ label: t('CHOOSE ANOTHER FOLDER…'), pick: () => pickFolder() }]
+      : folders.map((f) => ({ label: t('TAKE “{name}” OFF THE SHELF · ITS FILES STAY', { name: f.name }), pick: async () => { await shelf.app.cdp.removeMusicFolder(f.path); await load(); } }))),
+  ], { alignEnd: true });
+}
+
+async function load({ quiet = false } = {}) {
+  const generation = ++shelf.generation;
+  shelf.loading = true;
+  shelf.quietLoad = quiet; // a quiet one shows no READING YOUR MUSIC, nor its count of files
+  if (!quiet) {
+    $('shelf-count').textContent = t('READING YOUR MUSIC…');
+    $('shelf-body').replaceChildren();
+  }
+  let result;
+  try { result = await shelf.app.cdp.shelfAlbums(); } catch { result = { folder: null, albums: [], error: true }; }
+  if (generation !== shelf.generation) return;
+  shelf.loading = false;
+  shelf.quietLoad = false;
+  // A case or the booklet was taken out while the folder was read: the shelf is brought up to date once it's put back.
+  if (quiet && (shelf.caseOpen || isBookletOpen())) { refresh.request(); return; }
+  // The music folder changed, but nothing the shelf shows did: leave it as it is.
+  if (quiet && (result.name || null) === shelf.folderName && shelfSignature(result.albums) === shelfSignature(shelf.albums)) return;
+  const scroll = quiet ? $('shelf-body').scrollTop : 0;
+  shelf.albums = result.albums;
+  // Colours worked out before: spines in them at once, and a colour-sorted shelf ready.
+  shelf.colorCache = await shelf.app.cdp.shelfColors().catch(() => ({})) || {};
+  for (const a of shelf.albums) {
+    const c = shelf.colorCache[a.id];
+    if (c) { shelf.colors.set(a.id, c.spine); a.color = c.main; }
+  }
+  // What Discogs said before: pressings and prices at once, for SORT: PRICE and the spines' gold dots.
+  const known = await shelf.app.cdp.discogsKnown(shelf.albums.map((a) => a.id)).catch(() => ({})) || {};
+  shelf.pressings = new Map(Object.entries(known));
+  attachPressings();
+  shelf.settings = await shelf.app.cdp.discogsSettings().catch(() => null);
+  shelf.appraisalNote = totalNote();
+  shelf.hidden = new Set(result.hiddenMissing || []);
+  shelf.wanted = (await shelf.app.cdp.wantList().catch(() => null) || { items: [] }).items;
+  shelf.moves = result.moves || [];
+  shelf.folderName = result.name || null;
+  render();
+  if (quiet) $('shelf-body').scrollTop = scroll;
+  else { const today = todayLine(shelf.albums); if (today) say(today); } // ON THIS DAY, said as the shelf opens
+}
+
+// With no folder yet, or nothing in it, there's nothing for these to work on: they're off until there is.
+function dimTools(idle) { for (const id of ['shelf-filter', 'shelf-share', 'shelf-check', 'shelf-pull', 'shelf-take', 'shelf-appraise', 'shelf-show', 'shelf-sort']) $(id).disabled = idle; }
+// The albums the shelf shows: those its search finds, of the ones SHOW stands on it.
+function foundAlbums() {
+  const query = $('shelf-filter').value, now = Date.now();
+  return shelf.albums.filter((a) => matchesFilter(a, query, (stickersFor(a).obi || {}).catalog) // the number on its obi too
+    && showsAlbum(a, shelf.show, now));
+}
+/**
+ * TAKE ALONG's "the shelf as it is": every album (`all`, also while the shelf hasn't been read yet), or the songs of
+ * the ones it shows (`paths`) with a search typed or SHOW at something; `count` albums (null: not known yet), `label`.
+ */
+export function shelfTakeAlong() {
+  const filtering = shelf.albums.length && (shelf.show !== 'ALL' || $('shelf-filter').value.trim());
+  if (!filtering) return { all: true, count: shelf.albums.length ? groupEditions(shelf.albums).length : null, label: null };
+  const found = foundAlbums();
+  return { paths: found.flatMap((a) => a.tracks.map((tr) => tr.path)), count: found.length, label: shelf.show !== 'ALL' ? shelf.showLabel : `“${$('shelf-filter').value.trim()}”` };
+}
+function render() {
+  const body = $('shelf-body');
+  if (shelf.observer) shelf.observer.disconnect();
+  if (!shelf.folderName) {
+    dimTools(true);
+    $('shelf-count').textContent = '';
+    body.replaceChildren(el('div', { class: 'shelf-empty' },
+      el('div', {}, t('Which folder is your music in?')),
+      pill(t('CHOOSE YOUR MUSIC FOLDER…'), pickFolder)));
+    return;
+  }
+  const query = $('shelf-filter').value, filtering = !!query.trim();
+  const showing = shelf.show !== 'ALL';
+  const found = foundAlbums();
+  // An album's editions behind one spine, and counted as one (first all of them, then the ones shown: each sets them)
+  const n = groupEditions(shelf.albums).length;
+  dimTools(!n);
+  const shown = groupEditions(found);
+  $('shelf-show').textContent = showing ? `${t('SHOW|shelf')}: ${shelf.showLabel}` : t('SHOW: ALL');
+  $('shelf-show').classList.toggle('on', showing);
+  $('shelf-fill').hidden = !shelf.app.changerMode();
+  $('shelf-fill').disabled = !shown.length;
+  showWantCount();
+  showFill();
+  // (The folder's name is the count's tooltip: the line keeps its room for the albums and what the shelf is worth.)
+  shelf.countBase = [n === 1 ? t('1 ALBUM') : t('{n} ALBUMS', { n }), filtering || showing ? t('{n} SHOWN', { n: shown.length }) : null].filter(Boolean).join(' · ');
+  $('shelf-count').title = shelf.folderName ? t('Your music folder: {name}', { name: shelf.folderName }) : '';
+  renderCount();
+  if (!n) { body.replaceChildren(el('div', { class: 'shelf-empty' }, el('div', {}, t('No music in this folder yet.')), pill(t('CHOOSE ANOTHER FOLDER…'), pickFolder))); return; }
+  if (!shown.length && showing && !filtering) { body.replaceChildren(el('div', { class: 'shelf-empty' }, el('div', {}, t('No albums like that on the shelf.')), pill(t('SHOW ALL'), () => setShow('ALL')))); showIndex([]); return; }
+  if (!shown.length) { body.replaceChildren(el('div', { class: 'shelf-empty' }, el('div', {}, t('Nothing on the shelf for “{query}”.', { query: query.trim() })), pill(t('CLEAR THE SEARCH'), () => { $('shelf-filter').value = ''; render(); }))); showIndex([]); return; }
+  shelf.observer = new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { shelf.observer.unobserve(e.target); loadCover(e.target.album, e.target); }
+  }, { root: body, rootMargin: '200px' });
+  const now = Date.now(), sort = shelf.app.state.shelfSort;
+  $('shelf-sort').textContent = `⇅ ${SORT_LABELS[sort] || sort}`; // (what SORT is, the tooltip says)
+  if (sort === 'COLOR') { if (shelf.fillCount) shelf.fillCount(); fillColors(shown); }
+  shelf.shown = shown;
+  if (shelf.boxObserver) shelf.boxObserver.disconnect();
+  shelf.onScreen.clear();
+  if (sort !== 'ARTIST') stopLookups();
+  const boxes = sort === 'ARTIST' && !showing ? boxesFor({ albums: shelf.albums, shown: found, discogs: shelf.discogs, hidden: shelf.hidden, open: shelf.openBoxes, query }) : new Map();
+  const arranged = arrange(shown, sort, { currency: (shelf.settings && shelf.settings.currency) || 'USD' });
+  showIndex(jumpTargets(arranged));
+  showHere();
+  const items = withMissing(arranged, boxes).map((a) => {
+    if (a.box) return boxCard(a.box);
+    if (a.ghost) return ghostSpine(a.ghost, a.artist);
+    if (a.divider) return el('div', { class: `shelf-divider${[...a.divider].length <= 2 ? ' short' : ''}`, 'aria-hidden': 'true', 'data-section': a.divider }, el('span', {}, a.divider));
+    const st = a.stickers = stickersFor(a, now);
+    const kind = caseKind(a.discs);
+    const spine = el('button', { class: `spine${kind ? ` ${kind}` : ''}${st.obi ? ' obi' : ''}${st.isNew ? ' new' : ''}${a.foundIt ? ' found' : ''}${spineHolds(a, shelf.inPlayer) ? ' in-player' : ''}${isRare(a.pressing) ? ' rare' : ''}`, title: spineTitle(a), onClick: () => { if (!shelf.dragged) openCase(a, spine); } },
+      el('span', { class: 'spine-text' }, a.artist ? el('b', {}, a.artist) : null, a.artist ? ' · ' : null, a.title),
+      st.obi ? el('span', { class: 'obi-cat' }, st.obi.catalog) : null,
+      a.foundIt ? el('span', { class: 'sticker-new sticker-found' }, t('FOUND IT')) : st.isNew ? el('span', { class: 'sticker-new' }, t('NEW')) : null,
+      todayOf(a, now) ? el('span', { class: `sticker-today ${todayOf(a, now).kind}` }, todayOf(a, now).label) : null,
+      a.wrapped ? el('span', { class: 'spine-film' }) : null,
+      bookmarkOf(a) ? el('span', { class: 'spine-bookmark' }) : null,
+      a.editions ? el('span', { class: `spine-editions${a.editions.length > 2 ? ' more' : ''}` }) : null,
+      kind ? el('span', { class: 'spine-discs', title: t('{n} DISCS', { n: a.discs }) }, t('{n} CD', { n: a.discs })) : null);
+    spine.album = a;
+    markSlot(spine);
+    showNoteTab(spine);
+    spine.addEventListener('pointerdown', (e) => pressSpine(e, spine));
+    spine.addEventListener('pointermove', (e) => rubSpine(e, spine));
+    spine.addEventListener('pointerleave', () => { spine.wiper = null; clearTimeout(spine.lookAhead); });
+    // A hand on a spine: its disc's picture looked up ahead (it takes the archive seconds), there by the time it's out.
+    spine.addEventListener('pointerenter', () => { spine.lookAhead = setTimeout(() => discArtOf(a), 250); });
+    setDust(spine, st.isNew ? 0 : dustLevel(a.touched, now)); // a new album is fresh from the shop
+    paintSpine(spine, a);
+    shelf.observer.observe(spine);
+    return spine;
+  });
+  const moved = movedNotice();
+  body.replaceChildren(...(moved ? [moved] : []), el('div', { class: 'shelf-rows' }, items));
+}
+
+// Songs played before their folder moved (a new drive, a new computer): their plays, dust and history are still kept
+// under the old paths. The folder with the most of them is offered, to bring them along or be told they're other songs.
+// SHOW: which albums stand on the shelf (shelf-show.js) — the kinds there are, then decades and genres, each with how
+// many. Picking one again, or ALL, stands them all back.
+function setShow(show, label = null) {
+  shelf.show = show; shelf.showLabel = label;
+  render();
+  $('shelf-body').scrollTop = 0;
+}
+const SHOW_LABELS = { DUSTY: t('DUSTY'), WRAPPED: t('STILL WRAPPED'), LEFT: t('LEFT PART-WAY'), NOTE: t('WITH A NOTE'), UNPLAYED: t('NEVER PLAYED') };
+function showMenu() {
+  const c = showChoices(shelf.albums);
+  const item = (show, label, count) => ({ label: `${label} · ${count}`, current: shelf.show === show, pick: () => setShow(shelf.show === show ? 'ALL' : show, label) });
+  shelf.app.menu($('shelf-show'), [
+    { label: t('ALL · {n}', { n: shelf.albums.length }), current: shelf.show === 'ALL', pick: () => setShow('ALL') },
+    ...c.kinds.map((k) => item(k.show, SHOW_LABELS[k.show], k.count)),
+    ...(c.decades.length > 1 ? [{ divider: true }, ...c.decades.map((d) => item(d.show, t('{decade}s', { decade: d.decade }), d.count))] : []),
+    ...(c.genres.length > 1 ? [{ divider: true }, ...c.genres.map((g) => item(g.show, g.label.toUpperCase(), g.count))] : []),
+    ...(c.dividers.length ? [{ divider: true }, ...c.dividers.map((d) => item(d.show, d.label.toUpperCase(), d.count))] : []),
+  ], { alignEnd: true });
+}
+
+// A folder by the end of its path ("…/Volumes/Music"), the whole of it in the tooltip.
+const shortPath = (p) => { const ps = String(p || '/').split(/[\\/]+/).filter(Boolean); return ps.length > 2 ? `…/${ps.slice(-2).join('/')}` : (p || '/'); };
+function movedNotice() {
+  const g = shelf.moves && shelf.moves[0];
+  if (!g) return null;
+  const act = async (fn) => {
+    shelf.moves = [];
+    render();
+    await fn(g.key).catch(() => {});
+    await load();
+  };
+  return el('div', { class: 'shelf-moved', role: 'status' },
+    el('div', { class: 'shelf-moved-text', title: `${g.from || '/'} → ${g.to || '/'}` },
+      g.count === 1 ? t('A song you’ve played has moved from {from} to {to}. Its plays, dust and history stayed behind.', { from: shortPath(g.from), to: shortPath(g.to) })
+        : t('{n} songs you’ve played have moved from {from} to {to}. Their plays, dust and history stayed behind.', { n: g.count, from: shortPath(g.from), to: shortPath(g.to) })),
+    el('div', { class: 'row-pills' },
+      pill(t('BRING THEIR HISTORY'), () => act(async (key) => {
+        const n = await shelf.app.cdp.applyMove(key);
+        await shelf.app.loadHistoryFromDisk();
+        await shelf.app.reloadSkips(); // the marks moved with the songs
+        if (n) shelf.app.setStatus(t('HISTORY MOVED'));
+      }), t('Their plays, dust and history go with them to where they are now')),
+      pill(t('NOT THE SAME SONGS'), () => act((key) => shelf.app.cdp.declineMove(key)), t('Don’t ask about this folder again'))));
+}
+
+// A spine before its cover has loaded gets a colour of its own from its name, so the shelf never looks blank.
+function hashColor(text) {
+  let h = 0;
+  for (const ch of String(text)) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return [40 + (h % 60), 40 + ((h >> 8) % 60), 50 + ((h >> 16) % 60)];
+}
+function paintSpine(spine, a) {
+  // Sorted by colour, a spine wears its cover's main colour, so the shelf reads as a rainbow; otherwise its average.
+  const byColor = shelf.app && shelf.app.state.shelfSort === 'COLOR' && a.color;
+  const c = byColor ? a.color : shelf.colors.get(a.id) || hashColor(a.title + a.artist);
+  const light = (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) > 150;
+  spine.style.setProperty('--spine', `${c[0]}, ${c[1]}, ${c[2]}`);
+  spine.style.setProperty('--ink', light ? '20, 20, 24' : '240, 240, 244');
+}
+
+// The cover's average colour, for the spine, from its pixels (RGBA).
+function averageOf(d) {
+  let r = 0, gr = 0, b = 0;
+  for (let i = 0; i < d.length; i += 4) { r += d[i]; gr += d[i + 1]; b += d[i + 2]; }
+  const n = d.length / 4;
+  return [Math.round(r / n), Math.round(gr / n), Math.round(b / n)];
+}
+
+async function coverFor(a, { online = true } = {}) {
+  if (shelf.covers.has(a.id)) return shelf.covers.get(a.id);
+  const url = await shelf.app.cdp.shelfCover(a.tracks[0].path, { online }).catch(() => null);
+  if (url || online) shelf.covers.set(a.id, url); // nothing on this computer: the web may still have one
+  return url;
+}
+async function loadCover(a, spine) {
+  const url = await coverFor(a);
+  if (url) await colorsFor(a, url);
+  if (shelf.colors.has(a.id)) paintSpine(spine, a);
+}
+// An album's colours from its cover — the spine's (its average) and the one it's filed under by colour (its most
+// common vivid one) — worked out once per cover and kept (shelf-colors.json).
+// One small canvas kept in the CPU's memory for all of them (reading pixels back off the GPU, per spine, made the
+// shelf stutter as it scrolled).
+let pixelCanvas = null;
+async function colorsFor(a, url) {
+  const key = hash(url), known = shelf.colorCache[a.id];
+  if (known && known.key === key) return;
+  const img = new Image();
+  img.src = url;
+  try { await img.decode(); } catch { shelf.noCover.add(a.id); return; } // an unreadable cover: filed with B&W
+  if (!pixelCanvas) pixelCanvas = new OffscreenCanvas(16, 16);
+  const g = pixelCanvas.getContext('2d', { willReadFrequently: true });
+  const s = Math.min(img.naturalWidth, img.naturalHeight);
+  g.clearRect(0, 0, 16, 16);
+  g.drawImage(img, (img.naturalWidth - s) / 2, (img.naturalHeight - s) / 2, s, s, 0, 0, 16, 16);
+  const pixels = g.getImageData(0, 0, 16, 16).data;
+  const main = dominantColor(pixels), spine = averageOf(pixels);
+  shelf.colors.set(a.id, spine);
+  a.color = main;
+  shelf.colorCache[a.id] = { key, spine, main };
+  clearTimeout(shelf.colorsTimer);
+  shelf.colorsTimer = setTimeout(() => shelf.app.cdp.saveShelfColors(shelf.colorCache).catch(() => {}), 1000);
+}
+// SORT: COLOR needs every album's colour, not only those whose spines have been on screen: the rest are worked out
+// now, with the count in the header, and the shelf stands in rainbow order once they're all in.
+async function fillColors(shown) {
+  if (shelf.filling) return;
+  const todo = shown.filter((a) => !a.color && !shelf.noCover.has(a.id));
+  if (!todo.length) return;
+  shelf.filling = true;
+  const generation = shelf.generation;
+  let done = 0;
+  const count = () => { $('shelf-count').textContent = t('SORTING BY COLOR · {done} / {total}', { done, total: todo.length }); };
+  shelf.fillCount = count; // a redraw meanwhile shows it again
+  count();
+  // Four at a time, and only covers on this computer (not a web lookup for every album in the library).
+  let next = 0;
+  const worker = async () => {
+    while (next < todo.length) {
+      if (generation !== shelf.generation || !shelf.open || shelf.app.state.shelfSort !== 'COLOR') return;
+      const a = todo[next++];
+      const url = await coverFor(a, { online: false });
+      if (url) await colorsFor(a, url); else shelf.noCover.add(a.id);
+      done++; count();
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  for (const a of todo) if (!a.color && generation === shelf.generation) shelf.noCover.add(a.id); // never asked about again: no loop
+  shelf.filling = false;
+  shelf.fillCount = null;
+  if (generation === shelf.generation && shelf.open && shelf.app.state.shelfSort === 'COLOR') redraw.request();
+}
+
+// ---- A spine carried off the shelf, onto the disc or the queue ---------------------------------------------------
+
+const DRAG_START_PX = 6;
+function pressSpine(e, spine) {
+  if (e.button !== 0 || shelf.caseOpen) return;
+  const start = { x: e.clientX, y: e.clientY };
+  let drag = null;
+  shelf.dragged = false;
+  const move = (ev) => {
+    if (!drag && Math.hypot(ev.clientX - start.x, ev.clientY - start.y) > DRAG_START_PX) drag = pickUp(spine, start);
+    if (drag) carry(drag, ev.clientX, ev.clientY);
+  };
+  // Followed on the window, wherever the pointer goes while the spine is carried.
+  const up = (ev) => {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    window.removeEventListener('pointercancel', up);
+    if (!drag) return;
+    shelf.dragged = true; // the click that follows isn't "open the case"
+    setTimeout(() => { shelf.dragged = false; }, 0);
+    putDown(drag, ev.type === 'pointerup' ? targetAt(ev.clientX, ev.clientY) : null, ev.shiftKey);
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
+}
+function pickUp(spine, start) {
+  const r = spine.getBoundingClientRect();
+  const ghost = spine.cloneNode(true);
+  ghost.classList.add('spine-ghost');
+  ghost.classList.remove('in-player');
+  Object.assign(ghost.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+  document.body.append(ghost);
+  spine.classList.add('lifted');
+  $('shelf').classList.add('carrying');
+  return { spine, ghost, from: r, grab: { x: start.x - r.left, y: start.y - r.top }, target: null };
+}
+// Where a spine let go at (x, y) would go: the disc (in its case) or the queue.
+function targetAt(x, y) {
+  const c = shelf.app.disc.center;
+  if (c && !shelf.app.state.miniMode && Math.abs(x - c.x) <= c.r + 30 && Math.abs(y - c.y) <= c.r + 30) return 'disc';
+  const q = $('queue-card').getBoundingClientRect();
+  if (q.width && x >= q.left && x <= q.right && y >= q.top && y <= q.bottom) return 'queue';
+  return null;
+}
+function carry(drag, x, y) {
+  drag.ghost.style.transform = `translate(${x - drag.grab.x - drag.from.left}px, ${y - drag.grab.y - drag.from.top}px) rotate(-6deg)`;
+  const target = targetAt(x, y);
+  if (target === drag.target) return;
+  drag.target = target;
+  showDropTarget(target);
+}
+// A ring round the disc, or an outline round the queue, while a spine is over it.
+function showDropTarget(target) {
+  let ring = $('drop-ring');
+  if (!ring) { ring = el('div', { id: 'drop-ring' }); document.body.append(ring); }
+  ring.hidden = !target;
+  if (!target) return;
+  if (target === 'disc') {
+    const c = shelf.app.disc.center;
+    Object.assign(ring.style, { left: `${c.x - c.r - 6}px`, top: `${c.y - c.r - 6}px`, width: `${2 * c.r + 12}px`, height: `${2 * c.r + 12}px`, borderRadius: '50%' });
+  } else {
+    const q = $('queue-card').getBoundingClientRect();
+    Object.assign(ring.style, { left: `${q.left - 6}px`, top: `${q.top - 6}px`, width: `${q.width + 12}px`, height: `${q.height + 12}px`, borderRadius: '10px' });
+  }
+}
+function putDown(drag, target, next = false) {
+  const { spine, ghost } = drag;
+  const a = spine.album;
+  showDropTarget(null);
+  const back = () => { ghost.remove(); spine.classList.remove('lifted'); $('shelf').classList.remove('carrying'); };
+  if (target === 'disc') { back(); play(a, 0); return; }
+  if (target === 'queue') { back(); shelf.app.loadDisc(discOfAlbum(a), a.tracks.map((t) => t.path), { next }); return; } // ⇧: to play next
+  // Let go anywhere else: it goes back in its place on the shelf.
+  if (!anim.enabled) { back(); return; }
+  ghost.animate([{ transform: ghost.style.transform }, { transform: 'none' }], { duration: 220, easing: 'cubic-bezier(.3,.7,.3,1)' }).onfinish = back;
+}
+
+// ---- Getting about: the index down the side, and the album in the player -----------------------------------------
+
+// A button for each section (letter, month, decade, colour…) down the shelf's right edge; click one to go to it.
+function showIndex(targets) {
+  const index = $('shelf-index');
+  index.hidden = targets.length < 2;
+  index.replaceChildren(...targets.map(({ label, short }) => el('button', { title: label, class: [...short].length > 3 ? 'long' : null, onClick: () => {
+    const card = $('shelf-body').querySelector(`[data-section="${CSS.escape(label)}"]`);
+    if (!card) return;
+    card.scrollIntoView({ block: 'start', behavior: anim.enabled ? 'smooth' : 'auto' });
+    pointOut(card);
+  } }, short)));
+}
+// A section jumped to answers, whether or not the shelf had to move (a shelf that fits on the screen doesn't): its card
+// stands up, lit, and its albums lift one after another.
+function pointOut(card) {
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+  const lit = `0 0 0 2px rgb(${accent}), 0 0 18px rgba(${accent}, .55)`;
+  if (!anim.enabled) { card.animate([{ boxShadow: lit }, { boxShadow: lit }], { duration: 900 }); return; }
+  const delay = 250; // (after a scroll has got there)
+  card.animate([{ transform: 'none', boxShadow: 'none' }, { transform: 'translateY(-14px)', boxShadow: lit, offset: 0.35 }, { transform: 'translateY(-14px)', boxShadow: lit, offset: 0.7 }, { transform: 'none', boxShadow: 'none' }],
+    { duration: 900, delay, easing: 'ease-in-out' });
+  let k = 0;
+  for (let n = card.nextElementSibling; n && !n.dataset.section && k < 40; n = n.nextElementSibling) {
+    if (!n.classList.contains('spine')) continue;
+    n.animate([{ transform: 'none' }, { transform: 'translateY(-10px)' }, { transform: 'none' }], { duration: 420, delay: delay + 150 + k * 35, easing: 'ease-in-out' });
+    k++;
+  }
+}
+// ⌖ IN THE PLAYER: shown while the album whose disc is in is on the shelf as it stands; goes to it, and it waves.
+function showHere() {
+  $('shelf-here').hidden = !(shelf.inPlayer && (shelf.shown || []).some((a) => spineHolds(a, shelf.inPlayer)));
+}
+function goToPlayer() {
+  const spine = [...document.querySelectorAll('#shelf-body .spine')].find((s) => s.album && spineHolds(s.album, shelf.inPlayer));
+  if (!spine) return;
+  spine.scrollIntoView({ block: 'center', inline: 'nearest', behavior: anim.enabled ? 'smooth' : 'auto' });
+  if (anim.enabled) setTimeout(() => spine.animate([{ transform: 'translateY(-12px)' }, { transform: 'translateY(-26px)' }, { transform: 'translateY(-12px)' }], { duration: 420, easing: 'ease-in-out' }), 350);
+}
+
+// ---- Missing albums (shelf-missing.js) -------------------------------------------------------------------------
+
+function boxCard(box) {
+  const card = el('button', { class: `missing-box${box.state !== 'found' ? ' waiting' : ''}${box.state === 'found' && !box.missing.length ? ' complete' : ''}${box.open ? ' open' : ''}`,
+    title: box.state !== 'found' ? t('Looking up {artist} on MusicBrainz…', { artist: box.artist }) : box.missing.length ? (box.open ? t('{artist}: releases you don’t have — click to close', { artist: box.artist }) : t('{artist}: releases you don’t have — click to show them', { artist: box.artist })) : t('You have everything {artist} has released', { artist: box.artist }),
+    onClick: () => {
+      if (box.state !== 'found' || !box.missing.length) return;
+      if (shelf.openBoxes.has(box.key)) shelf.openBoxes.delete(box.key); else shelf.openBoxes.add(box.key);
+      render();
+    } }, el('span', {}, boxLabel(box)));
+  card.box = box;
+  if (box.state === 'loading') watchBox(card);
+  return card;
+}
+// No more looking up discographies (the shelf closed, or isn't by artist): whoever was waiting is dropped.
+function stopLookups() {
+  clearTimeout(shelf.wantTimer);
+  if (!shelf.asking) return;
+  shelf.asking = false;
+  shelf.app.cdp.wantDiscography([]).catch(() => {});
+}
+// A box that's waiting: once it's on screen, MusicBrainz is asked about its artist (a moment after scrolling stops).
+function watchBox(card) {
+  if (!shelf.boxObserver) {
+    shelf.boxObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) { if (e.isIntersecting) shelf.onScreen.add(e.target.box); else shelf.onScreen.delete(e.target.box); }
+      clearTimeout(shelf.wantTimer);
+      shelf.wantTimer = setTimeout(() => {
+        shelf.asking = shelf.onScreen.size > 0;
+        shelf.app.cdp.wantDiscography([...shelf.onScreen].map((b) => ({ artist: b.artist, mbid: b.mbid }))).catch(() => {});
+      }, 250);
+    }, { root: $('shelf-body'), rootMargin: '200px' });
+  }
+  shelf.boxObserver.observe(card);
+}
+function ghostSpine(group, artist) {
+  const wanted = isWanted(shelf.wanted, artist, group.title);
+  const spine = el('button', { class: `spine ghost${wanted ? ' wanted' : ''}`, title: [artist, group.title, group.year].filter(Boolean).join(' · '),
+    onClick: () => openGhostCase(group, artist, spine) },
+    el('span', { class: 'spine-text' }, group.title, group.year ? ` · ${group.year}` : ''),
+    wanted ? el('span', { class: 'spine-want' }, '★') : null);
+  spine.ghost = group; spine.ghostArtist = artist;
+  return spine;
+}
+// A missing album's ghost case: see-through, its cover from the Cover Art Archive and its tracklist from MusicBrainz,
+// to play on Spotify (when connected), look up on MusicBrainz or YouTube Music, or never see again.
+async function openGhostCase(group, artist, spine) {
+  if (shelf.caseOpen) return;
+  const { app } = shelf;
+  const from = spine.getBoundingClientRect();
+  const blank = el('div', { class: 'case-cover cdr ghost-cover' }, el('div', { class: 'marker' }, group.title), el('div', { class: 'marker small' }, artist));
+  const front = el('div', { class: 'case-front' }, blank);
+  // Fetched by main (the page may only show pictures it already has, as data).
+  app.cdp.coverFromUrl(`https://coverartarchive.org/release-group/${group.id}/front-250`).then((src) => {
+    if (!src || !blank.isConnected) return;
+    blank.replaceWith(el('img', { class: 'case-cover', src, alt: '' }));
+  }).catch(() => {});
+  const tracks = el('div', { class: 'case-tracks scroll' }, el('div', { class: 'case-track' }, el('span', { class: 'name' }, '…')));
+  app.cdp.missingTracklist(group.id).then((editions) => {
+    tracks.replaceChildren(...(editions[0] || []).map((t, i) => el('div', { class: 'case-track' },
+      el('span', { class: 'no' }, String(i + 1).padStart(2, '0')), el('span', { class: 'name' }, t.title),
+      el('span', { class: 'time' }, t.length ? app.formatTime(t.length) : ''))));
+  }).catch(() => tracks.replaceChildren(el('div', { class: 'case-track' }, el('span', { class: 'name' }, t("COULDN'T REACH MUSICBRAINZ")))));
+  const spotifyButton = pill(t('PLAY ON SPOTIFY'), async () => {
+    if (spotifyButton.disabled) return; // already looking: one disc, not two
+    spotifyButton.disabled = true;
+    try { await playMissingOnSpotify(group, artist); } finally { spotifyButton.disabled = false; }
+  }, t('Find it on Spotify and play it as a disc'));
+  spotifyButton.hidden = true;
+  app.cdp.spotifyStatus().then((s) => { spotifyButton.hidden = !(s && s.connected); }).catch(() => {});
+  const card = el('div', { class: 'case-card ghost' }, front,
+    el('div', { class: 'case-info' },
+      el('div', { class: 'case-title' }, group.title),
+      el('div', { class: 'case-artist' }, [artist, group.year].filter(Boolean).join(' · ')),
+      el('div', { class: 'case-meta' }, t('NOT IN YOUR COLLECTION')),
+      tracks,
+      el('div', { class: 'case-actions' },
+        pill(t('BACK ON THE SHELF'), () => closeCase()),
+        wantButton(group, artist),
+        pill(t('NOT INTERESTED'), () => hideMissing(group), t('Never show this one on the shelf again')),
+        el('span', { class: 'grow' }),
+        pill(t('MUSICBRAINZ'), () => app.cdp.openMusicBrainz(group.id), t('Open its page on MusicBrainz')),
+        pill(t('YOUTUBE MUSIC'), () => app.cdp.openYouTubeMusic(`${artist} ${group.title}`), t('Find it on YouTube Music')),
+        spotifyButton)));
+  showCase(card, spine, from, hashColor(group.title + artist));
+}
+// ★ WANT: the album onto the WANT LIST (a card with its Discogs price), or, already on it, off it again.
+function wantButton(group, artist) {
+  const label = () => (isWanted(shelf.wanted, artist, group.title) ? t('★ WANTED') : t('★ WANT'));
+  const button = pill(label(), async () => {
+    const on = isWanted(shelf.wanted, artist, group.title);
+    const items = on ? await shelf.app.cdp.unwant(wantKey(artist, group.title)).catch(() => null)
+      : await shelf.app.cdp.want({ artist, title: group.title, year: group.year || null, groupId: group.id }).catch(() => null);
+    if (!items) return;
+    setWanted(items);
+    button.textContent = label();
+    say(on ? t('OFF YOUR WANT LIST') : t('ON YOUR WANT LIST · ITS CARD IS UNDER WANT LIST'));
+  }, t('Put it on your want list, with its lowest price on Discogs — crossed off by itself when it turns up in your music folder'));
+  button.classList.toggle('on', isWanted(shelf.wanted, artist, group.title));
+  return button;
+}
+/** The WANT LIST changed (a card added or removed): the ghost spines' stars and the button's count again. */
+export function setWanted(items) {
+  shelf.wanted = items || [];
+  if (!shelf.open) return;
+  showWantCount();
+  for (const spine of document.querySelectorAll('#shelf-body .spine.ghost')) {
+    if (!spine.ghost) continue;
+    const on = isWanted(shelf.wanted, spine.ghostArtist, spine.ghost.title);
+    spine.classList.toggle('wanted', on);
+    let star = spine.querySelector('.spine-want');
+    if (on && !star) { star = el('span', { class: 'spine-want' }, '★'); spine.append(star); } else if (!on && star) star.remove();
+  }
+}
+function showWantCount() {
+  const n = stillWanted(shelf.wanted);
+  $('shelf-want').textContent = n ? t('WANT LIST · {n}', { n }) : t('WANT LIST');
+}
+function hideMissing(group) {
+  shelf.hidden.add(group.id);
+  shelf.app.cdp.hideMissing(group.id).catch(() => {});
+  closeCase(true);
+  render();
+}
+// Spotify's copy of a missing album: the first album found whose title is the same, put in as a disc.
+async function playMissingOnSpotify(group, artist) {
+  const { app } = shelf;
+  const found = await app.cdp.spotifySearch(`album:${group.title} artist:${artist}`).catch(() => ({ error: 'OFFLINE' }));
+  const hit = (found.items || []).find((i) => i.kind === 'album' && sameName(i.name) === sameName(group.title));
+  if (!hit) { app.setStatus(t('NOT ON SPOTIFY')); return; }
+  const disc = await app.cdp.spotifyDiscTracks({ kind: 'album', id: hit.id }).catch(() => ({ error: 'OFFLINE' }));
+  if (!disc.tracks) { app.setStatus(t('NOT ON SPOTIFY')); return; }
+  closeCase(true);
+  app.playSpotifyDisc(disc.tracks, hit.name);
+}
+
+// The corner of an album's sticky note, showing above its spine.
+function showNoteTab(spine) {
+  const a = spine.album, noted = group(a).find((e) => e.note);
+  let tab = spine.querySelector('.note-tab');
+  if (!noted) { if (tab) tab.remove(); return; }
+  if (!tab) { tab = el('span', { class: 'note-tab' }); spine.append(tab); }
+  const { color, tilt } = noteLook(noted.id);
+  tab.style.setProperty('--note', color);
+  tab.style.transform = `rotate(${tilt * 1.5}deg)`;
+}
+
+// ---- The receipt ------------------------------------------------------------------------------------------------
+
+// The receipt behind a case's cover (shelf-receipt.js): its edge peeks out under the cover; click it and it's pulled
+// out and laid over the case, click again and it goes back. Its price is Discogs' once the case's lookup has one —
+// slip.showPressing(entry) puts it on when the answer comes in after the case is out.
+function receiptSlip(a, stickers) {
+  const r = receiptFor(a, stickers, a.pressing);
+  if (!r) return null;
+  const price = el('span', {}, r.price), total = el('span', {}, r.total);
+  const priceTitle = (receipt) => (receipt.discogs ? t('The lowest price on Discogs') : '');
+  const row = (left, right) => el('div', { class: 'rc-row' }, el('span', {}, left), typeof right === 'string' ? el('span', {}, right) : right);
+  const bars = el('div', { class: 'rc-bars' }, ...[...r.barcode].map((d) => el('i', { style: `width:${1 + (Number(d) % 3)}px;margin-right:${1 + (Number(d) % 2)}px` })));
+  const slip = el('div', { class: 'receipt', title: t('The receipt') },
+    el('div', { class: 'rc-shop' }, r.shop), el('div', { class: 'rc-center' }, r.address),
+    el('div', { class: 'rc-rule' }), row(r.date, r.time), el('div', { class: 'rc-rule' }),
+    el('div', { class: 'rc-item' }, r.item), row(t('CD × 1'), price),
+    el('div', { class: 'rc-rule' }), row(t('TOTAL'), total), row(r.paid, ''),
+    el('div', { class: 'rc-rule' }), el('div', { class: 'rc-center' }, `NO. ${r.number}`), bars,
+    el('div', { class: 'rc-center rc-small' }, t('THANK YOU · NO REFUNDS ON OPENED CDs')));
+  slip.addEventListener('click', (e) => { e.stopPropagation(); slip.classList.toggle('out'); });
+  slip.showPressing = (entry) => {
+    const now = receiptFor(a, stickers, entry);
+    price.textContent = now.price; total.textContent = now.total;
+    price.title = total.title = priceTitle(now);
+  };
+  price.title = total.title = priceTitle(r);
+  return slip;
+}
+
+// ---- Shrink-wrap -----------------------------------------------------------------------------------------------
+
+// The film over a new album's case: take hold of it and drag it across; past 40% of the way it tears off, short of
+// that it springs back.
+function caseFilm(a) {
+  const film = el('div', { class: 'case-film', title: t('Drag across to unwrap it') }, el('span', { class: 'film-tab' }));
+  film.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || !a.wrapped) return;
+    e.preventDefault(); e.stopPropagation();
+    try { film.setPointerCapture(e.pointerId); } catch { /* gone */ }
+    const x0 = e.clientX, w = film.getBoundingClientRect().width;
+    film.classList.add('pulling');
+    const move = (ev) => {
+      const dx = ev.clientX - x0;
+      film.style.transform = `translateX(${dx * 0.5}px) rotate(${(dx / w) * 5}deg)`;
+    };
+    const up = (ev) => {
+      film.removeEventListener('pointermove', move);
+      film.removeEventListener('pointerup', up);
+      film.removeEventListener('pointercancel', up);
+      film.classList.remove('pulling');
+      if (ev.type === 'pointerup' && Math.abs(ev.clientX - x0) > w * 0.4) { tearFilm(film, a, false, Math.sign(ev.clientX - x0)); return; }
+      // Just a click on it: the film rustles — it has to be pulled off first.
+      if (ev.type === 'pointerup' && Math.abs(ev.clientX - x0) < 4 && anim.enabled) {
+        film.style.transform = '';
+        film.animate([{ transform: 'none' }, { transform: 'translateX(-4px)' }, { transform: 'translateX(3px)' }, { transform: 'none' }], { duration: 240 });
+        return;
+      }
+      const from = film.style.transform;
+      film.style.transform = '';
+      if (anim.enabled && from) film.animate([{ transform: from }, { transform: 'none' }], { duration: 260, easing: 'cubic-bezier(.3,1.6,.5,1)' });
+    };
+    film.addEventListener('pointermove', move);
+    film.addEventListener('pointerup', up);
+    film.addEventListener('pointercancel', up);
+  });
+  return film;
+}
+// Unwraps the album: remembered, its spine loses its film, and the film flies off the case. → when it's gone.
+function tearFilm(film, a, quick = false, dir = 1) {
+  if (!a.wrapped) return Promise.resolve();
+  a.wrapped = false;
+  shelf.app.cdp.tearWrap(a.id).catch(() => {});
+  const spine = spineFor(a);
+  if (spine) { const f = spine.querySelector('.spine-film'); if (f) f.remove(); }
+  if (!anim.enabled) { film.remove(); return Promise.resolve(); }
+  const from = film.style.transform || 'none';
+  return new Promise((resolve) => {
+    film.animate([
+      { transform: from, opacity: 1 },
+      { transform: `translate(${dir * 60}%, 20%) rotate(${dir * 24}deg) scale(.9)`, opacity: 0 },
+    ], { duration: quick ? 220 : 380, easing: 'cubic-bezier(.4,0,.8,.6)', fill: 'forwards' }).onfinish = () => { film.remove(); resolve(); };
+  });
+}
+
+// ---- Dust -------------------------------------------------------------------------------------------------------
+
+function setDust(spine, level) {
+  spine.dust = level;
+  spine.classList.toggle('dusty', level > 0);
+  spine.style.setProperty('--dust', level.toFixed(3));
+}
+// Rubbing the mouse back and forth over a dusty spine (no button held) wipes a little off with each stroke; wiped
+// clean, it's remembered, and dust starts gathering again from now.
+const WIPE_PER_STROKE = 0.3;
+function rubSpine(e, spine) {
+  if (e.buttons || !spine.dust) return;
+  spine.wiper = spine.wiper || new Wiper();
+  if (!spine.wiper.move(e.clientX, e.timeStamp)) return;
+  puff(e.clientX, e.clientY, spine.dust);
+  const left = spine.dust - WIPE_PER_STROKE;
+  setDust(spine, left > 0.02 ? left : 0);
+  if (spine.dust) return;
+  const a = spine.album;
+  shelf.app.cdp.wipeAlbum(a.id).then((t) => { a.touched = t; }).catch(() => {});
+}
+// A little cloud of dust falling off where the spine was wiped.
+function puff(x, y, level) {
+  if (!anim.enabled) return;
+  for (let i = 0; i < 4 + Math.round(level * 6); i++) {
+    const size = 2 + Math.random() * 3;
+    const mote = el('div', { class: 'dust-mote' });
+    Object.assign(mote.style, { left: `${x + (Math.random() - 0.5) * 14}px`, top: `${y + (Math.random() - 0.5) * 8}px`, width: `${size}px`, height: `${size}px` });
+    document.body.append(mote);
+    const dx = (Math.random() - 0.5) * 30, dy = 30 + Math.random() * 40;
+    mote.animate([{ opacity: 0.8, transform: 'none' }, { opacity: 0, transform: `translate(${dx}px, ${dy}px)` }],
+      { duration: 600 + Math.random() * 500, easing: 'cubic-bezier(.2,.6,.4,1)' }).onfinish = () => mote.remove();
+  }
+}
+
+// PULL ONE: an album off the shelf at random — of those shown, the dustier the likelier — brought into view and
+// pulled out.
+// An album's spine on the shelf as it stands now (a redraw makes new ones), or null.
+const spineFor = (a) => [...document.querySelectorAll('#shelf-body .spine')].find((s) => s.album === a) || null;
+// …or the spine it stands behind, as one of its editions.
+const spineOf = (a) => spineFor(a) || [...document.querySelectorAll('#shelf-body .spine')].find((s) => s.album && group(s.album).includes(a)) || null;
+
+function pullOne() {
+  if (shelf.caseOpen || shelf.opening || shelf.pulling || !shelf.shown || !shelf.shown.length) return;
+  const a = pullToday(shelf.shown) || pickOne(shelf.shown); // (half the time one with a sticker for today, if any has)
+  const spine = spineFor(a);
+  if (!spine) return;
+  spine.scrollIntoView({ block: 'center', inline: 'nearest', behavior: anim.enabled ? 'smooth' : 'auto' });
+  shelf.pulling = true; // no redraw till it's out: the spine must still be the one on the shelf
+  setTimeout(async () => { try { if (shelf.open) await openCase(a, spine); } finally { shelf.pulling = false; } }, anim.enabled ? 450 : 0);
+}
+
+// FILL (changer mode): albums at random from those shown — the dustier, the likelier, as PULL ONE — into the changer's
+// free and finished slots. (Twice as many picked as there are slots: some may be in the changer already.) KEEP IT FULL
+// goes on doing it from the same albums each time a disc is played to its end, till it's picked again.
+const asPick = (a) => ({ disc: discOfAlbum(a), tracks: a.tracks.map((t) => t.path) });
+const picksFrom = (albums) => () => pickSome(albums, SLOTS * 2).map(asPick);
+// …WITH SIMILAR ALBUMS (similar-shelf.js): of those shown, albums by artists Last.fm finds like the one playing at the
+// time — the likest twenty to pick from, dustier likelier — and the usual picks after them, for the slots they don't fill
+// (and all of it the usual way while the one playing isn't on the shelf or Last.fm's answer isn't in).
+const albumPlaying = () => (shelf.inPlayer && shelf.albums.find((a) => holds(a, shelf.inPlayer))) || null;
+const similarPicksFrom = (albums) => () => {
+  const here = albumPlaying(), list = here && similar.known(here.artist);
+  if (here && !list) similar.get(here.artist); // for the next time
+  const like = list ? pickSome(similarPool(here.artist, albums, list).slice(0, 20).map((p) => p.album), SLOTS * 2) : [];
+  const usual = picksFrom(albums.filter((a) => !like.includes(a)))();
+  return [...like.map(asPick), ...usual];
+};
+// Last.fm's answer for the album playing waited for, a few seconds at most.
+const similarReady = () => { const here = albumPlaying(); return here ? Promise.race([similar.get(here.artist), new Promise((r) => setTimeout(r, 3000))]) : Promise.resolve(); };
+function fillChanger() {
+  if (!shelf.shown || !shelf.shown.length || !shelf.app.changerMode()) return;
+  const { app } = shelf, albums = shelf.shown.slice(), keeping = app.keepingFull(), playing = albumPlaying();
+  app.menu($('shelf-fill'), [
+    { label: t('FILL IT NOW'), pick: () => app.fillChanger(picksFrom(albums)()) },
+    playing && albums.length > 1 ? { label: t('FILL IT WITH SIMILAR ALBUMS'), pick: () => similarReady().then(() => app.fillChanger(similarPicksFrom(albums)())) } : null,
+    // (from one album there's nothing to keep it full with)
+    keeping ? { label: t('STOP KEEPING IT FULL'), current: true, pick: () => { app.keepChangerFull(null); app.setStatus(t('THE CHANGER NO LONGER FILLS ITSELF')); showFill(); } }
+      : albums.length > 1 ? { label: t('KEEP IT FULL FROM THESE {n} ALBUMS', { n: albums.length }),
+        pick: () => { app.keepChangerFull(picksFrom(albums)); app.setStatus(t('A FINISHED DISC MAKES ROOM FOR ANOTHER')); showFill(); } } : null,
+    !keeping && playing && albums.length > 1 ? { label: t('KEEP IT FULL WITH SIMILAR ALBUMS'),
+      pick: () => similarReady().then(() => { app.keepChangerFull(similarPicksFrom(albums)); app.setStatus(t('A FINISHED DISC MAKES ROOM FOR ONE LIKE WHAT’S PLAYING')); showFill(); }) } : null,
+  ].filter(Boolean), { alignEnd: true });
+}
+// FILL lit while the changer keeps itself full.
+function showFill() { $('shelf-fill').classList.toggle('on', shelf.app.changerMode() && shelf.app.keepingFull()); }
+
+// ---- The case, pulled out and turned to its front ----------------------------------------------------------------
+
+async function openCase(a, spine) {
+  if (shelf.caseOpen || shelf.opening) return;
+  const { app } = shelf;
+  // One case at a time, even while the first one's cover is still being fetched.
+  shelf.opening = true;
+  let cover;
+  try { cover = await coverFor(a); } finally { shelf.opening = false; }
+  if (!shelf.open || shelf.caseOpen) return;
+  if (!spine.isConnected) spine = spineFor(a) || spine; // the shelf was redrawn meanwhile
+  const from = spine.getBoundingClientRect();
+  // SKIP on a track: passed over as the music moves on (an intro, a skit), still played when picked — struck through.
+  const skipButton = (track, row) => {
+    const b = el('button', { class: `case-skip${app.isSkippedPath(track.path) ? ' on' : ''}`, title: t('SKIP: pass over this song as the music moves on — it still plays when you pick it'),
+      onClick: async (e) => { e.stopPropagation(); const on = await app.toggleSkip(track.path); b.classList.toggle('on', on); row.classList.toggle('skipped', on); } }, t('SKIP|track'));
+    return b;
+  };
+  const trackRow = (track, i, no = track.track || i + 1) => {
+    const row = el('div', { class: `case-track${app.isSkippedPath(track.path) ? ' skipped' : ''}`, title: t('Play from here'), onClick: () => unwrapped(() => play(a, i))() },
+      el('span', { class: 'no' }, no ? String(no).padStart(2, '0') : ''),
+      el('span', { class: 'name' }, track.title, a.artist === 'Various Artists' && track.artist ? el('span', { class: 'by' }, ` · ${track.artist}`) : null));
+    row.append(skipButton(track, row), el('span', { class: 'time' }, track.duration ? app.formatTime(track.duration) : ''));
+    return row;
+  };
+  // A set's songs disc by disc, under a DISC 2 heading each (box-set.js).
+  const discHead = (r) => el('div', { class: 'case-disc' }, t('DISC {n}', { n: r.disc }));
+  const tracks = withDiscHeads(a.tracks).map((r) => (r.path ? trackRow(r, a.tracks.indexOf(r)) : discHead(r)));
+  const trackList = el('div', { class: 'case-tracks scroll' }, tracks);
+  let wholeList = null; // the full tracklist once it's known, for the booklet too
+  // The album's whole tracklist from MusicBrainz, once its artist's discography is known: the songs you don't have
+  // stand in their place, in grey.
+  groupFor(a, shelf.discogs, app.cdp.discographyOf).then((group) => group && app.cdp.missingTracklist(group.id)).then((editions) => {
+    const edition = editions && pickEdition(editions, a.tracks.map((t) => t.title));
+    if (!edition || !trackList.isConnected) return;
+    const rows = fullTracklist(edition, a.tracks);
+    if (rows.every((r) => r.have)) return; // nothing missing: as it was
+    wholeList = rows;
+    trackList.replaceChildren(...withDiscHeads(rows, (r) => (r.have ? r.have.disc : null)).map((r) => (r.disc ? discHead(r) : r.have ? trackRow(r.have, a.tracks.indexOf(r.have), r.no) : el('div', { class: 'case-track missing', title: t('Not in your collection') },
+      el('span', { class: 'no' }, String(r.no).padStart(2, '0')), el('span', { class: 'name' }, r.title),
+      el('span', { class: 'time' }, r.length ? app.formatTime(r.length) : '')))));
+  }).catch(() => {});
+  const front = cover ? el('img', { class: 'case-cover', src: cover, alt: '' })
+    : el('div', { class: 'case-cover cdr' }, el('div', { class: 'marker' }, a.title), a.artist ? el('div', { class: 'marker small' }, a.artist) : null);
+  front.title = t('Open the case');
+  front.addEventListener('click', () => {
+    if (a.wrapped) { if (film && anim.enabled) film.animate([{ transform: 'none' }, { transform: 'translateX(-4px)' }, { transform: 'translateX(3px)' }, { transform: 'none' }], { duration: 240 }); return; } // unwrap it first
+    openLid(true);
+  });
+  // The jewel case opens on its hinge: the lid swings out to the left, the booklet held inside it (clicked, it comes
+  // out), the disc on the tray (clicked, it's played); a click on the tray beside the disc shuts the lid.
+  const lidInside = el('div', { class: 'case-lid-inside', title: t('Open the booklet'), onClick: () => openAlbumBooklet(a, lidInside, wholeList, caseLid()) });
+  // The lid, open, that the booklet's taken out of (and put back into): its front cover is what's seen on the case shut.
+  const caseLid = () => {
+    const r = caseFront.getBoundingClientRect();
+    return { rect: r, angle: matchMedia('(max-width: 1000px)').matches ? -97 : -106, perspective: 2000, origin: { x: r.left, y: r.top + r.height / 2 },
+      out: () => caseFront.classList.add('booklet-out'), back: () => caseFront.classList.remove('booklet-out') };
+  };
+  const caseCd = el('button', { class: 'case-cd', title: t('Play'), style: cover ? `--art: url("${cover}")` : '', onClick: (e) => {
+    e.stopPropagation();
+    if (!anim.enabled) { play(a, 0); return; }
+    caseCd.animate([{ transform: 'none' }, { transform: 'translateY(-10%) scale(1.06)', opacity: 0 }], { duration: 260, easing: EASE.in, fill: 'forwards' }).onfinish = () => play(a, 0);
+  } });
+  const tray = el('div', { class: 'case-tray', title: t('Close the case'), onClick: () => openLid(false) }, caseCd);
+  if (cover) { // printed as a pressed disc is (disc.js drawLabelPrint)
+    const img = new Image(); img.src = cover;
+    const print = { album: a.title || null, artist: a.artist || null, year: a.year || null, label: a.label || null };
+    const photo = discArtOf(a).then(async (u) => { if (!u) return null; const p = new Image(); p.src = u; await p.decode(); return p; }).catch(() => null);
+    img.decode().then(async () => { const p = await photo; printedDisc(caseCd, await labelImage(img, print, 520, p), p); }).catch(() => {});
+  }
+  const openLid = (open) => {
+    if (open) caseFront.classList.add('open');
+    lidEl._shutting = !open;
+    const swung = swingLid(lidEl, open ? (matchMedia('(max-width: 1000px)').matches ? -97 : -106) : 0, { onCross: (inside) => caseFront.classList.toggle('inside', inside) }); // (narrow: kept in the window)
+    if (!open) Promise.resolve(swung).then(() => { if (lidEl._shutting) caseFront.classList.remove('open'); }); // (shut first: the receipt under the disc not shown as it swings)
+    return swung;
+  };
+  const st = a.stickers || stickersFor(a);
+  // The sticky note: on the front when there is one; + NOTE sticks a blank one on to write.
+  const saveNote = (text) => {
+    a.note = text || null;
+    app.cdp.setNote(a.id, text).catch(() => {});
+    addNote.hidden = !!a.note;
+    const spine = spineOf(a);
+    if (spine) { showNoteTab(spine); spine.title = spineTitle(spine.album); }
+  };
+  // Shrink-wrap: dragged off by hand, or torn off at once by PLAY, PLAY NEXT or ADD TO QUEUE (or a track clicked).
+  const film = a.wrapped ? caseFilm(a) : null;
+  let tearing = null; // PLAY and co. while the film is coming off: once, not again with a second click
+  const unwrapped = (then) => () => {
+    if (tearing) return;
+    if (a.wrapped && film) { tearing = tearFilm(film, a, true).then(then); return; }
+    then();
+  };
+  // Into the queue or the changer; the case goes back once it's in — not when a full changer's question was turned
+  // down (Esc there closes the question, and the case stays out).
+  const putIn = async (opts) => {
+    const r = await app.loadDisc(discOfAlbum(a), a.tracks.map((t) => t.path), opts);
+    if (r && r.cancelled) return;
+    closeCase();
+    if (!opts && !app.changerMode()) say(t('ADDED {n} TO QUEUE', { n: a.tracks.length })); // (said where it's seen: the status line is under the shelf)
+  };
+  const addNote = pill(t('+ NOTE'), () => { addNote.hidden = true; lidFace.append(stickyNote({ id: a.id, text: '', onSave: saveNote })); }, t('Stick a note on the case'));
+  addNote.hidden = !!a.note;
+  const fileButton = dividerButton(a, spine);
+  const rare = el('div', { class: 'sticker-rare', hidden: !isRare(a.pressing) }, t('★ RARE'));
+  const receipt = receiptSlip(a, st);
+  // The price on the obi or the sticker: what it goes for on Discogs once that's known, else the shop's.
+  const tag = st.price ? el('div', { class: st.obi ? '' : 'sticker-price' }) : null;
+  const showTag = (entry) => {
+    if (!tag) return;
+    tag.textContent = discogsPrice(entry) || st.price;
+    // The obi is narrow: a long price ("1 234,50 CA$") gets smaller type to fit across it.
+    if (st.obi) tag.style.fontSize = tag.textContent.length > 7 ? `${Math.max(6, Math.floor(70 / tag.textContent.length))}px` : '';
+  };
+  showTag(a.pressing);
+  const lidFace = el('div', { class: 'case-lid-face' }, front, rare,
+      st.obi ? el('div', { class: 'case-obi' },
+        el('div', { class: 'obi-top' }, 'CD'),
+        el('div', { class: 'obi-title' }, a.title),
+        el('div', { class: 'obi-foot' }, el('div', {}, st.obi.catalog), tag)) : null,
+      !st.obi ? tag : null,
+      a.foundIt ? el('div', { class: 'sticker-new sticker-found' }, t('FOUND IT')) : st.isNew ? el('div', { class: 'sticker-new' }, t('NEW')) : null,
+      todaySticker(a) ? el('div', { class: `sticker-today ${todaySticker(a).kind}` }, todaySticker(a).label) : null,
+      film,
+      a.note ? stickyNote({ id: a.id, text: a.note, onSave: saveNote }) : null);
+  const lidEl = el('div', { class: 'case-lid' }, lidFace, lidInside);
+  const caseFront = el('div', { class: 'case-front' }, tray, receipt, lidEl);
+  const card = el('div', { class: 'case-card' },
+    caseFront,
+    el('div', { class: 'case-info' },
+      el('div', { class: 'case-title' }, a.title),
+      el('div', { class: 'case-artist' }, [a.artist, a.year].filter(Boolean).join(' · ')),
+      el('div', { class: 'case-meta' }, [a.tracks.length === 1 ? t('1 TRACK') : t('{n} TRACKS', { n: a.tracks.length }), a.duration ? app.formatTime(a.duration) : null, a.discs > 1 ? t('{n} DISCS', { n: a.discs }) : null, holds(a, shelf.inPlayer) ? IN_PLAYER : null].filter(Boolean).join(' · ')),
+      a.arrived ? el('div', { class: 'case-since' }, t('ON YOUR SHELF SINCE {date}', { date: new Date(a.arrived).toLocaleDateString(locale, { day: 'numeric', month: 'long', year: 'numeric' }) }).toLocaleUpperCase()) : null,
+      // (small, in one row with its editions: the actions underneath keep the track list its room in a small window)
+      el('div', { class: 'case-tools' }, ...editionButtons(a, spine), addNote, fileButton,
+        document.body.dataset.platform === 'android' ? null // (the phone is where it would go)
+          : pill(t('TAKE ALONG'), () => app.takeAlong({ album: { title: a.title, paths: a.tracks.map((tr) => tr.path) } }), t('Copy this album to a portable player, a phone or an SD card'))),
+      pressingBlock(a, rare, (entry) => { if (receipt) receipt.showPressing(entry); showTag(entry); }),
+      trackList,
+      similarRow(a),
+      el('div', { class: 'case-actions' },
+        pill(t('BACK ON THE SHELF'), () => closeCase()),
+        el('span', { class: 'grow' }),
+        pill(t('PLAY NEXT'), unwrapped(() => putIn({ next: true })), app.changerMode() ? t('Into the changer, to play after the disc playing') : t('Play the album next, after the song playing')),
+        app.changerMode() ? pill(t('INTO THE CHANGER'), unwrapped(() => putIn()), t('Load the album into the changer: a free slot, or one you pick'))
+          : pill(t('ADD TO QUEUE'), unwrapped(() => putIn()), t('Add every track to the end of the queue')),
+        a.bookmark ? pill(t('CONTINUE · TRACK {n}', { n: a.bookmark.track + 1 }), () => play(a, a.bookmark.track), leftAt(a)) : null,
+        el('button', { class: 'pill go', onClick: unwrapped(() => play(a, 0)) }, t('PLAY')))));
+  showCase(card, spine, from, shelf.colors.get(a.id) || hashColor(a.title + a.artist));
+}
+
+// IF YOU LIKE THIS (similar-shelf.js): up to five albums of yours by artists Last.fm finds like this one's — the row
+// comes in once its answer has (from similar-artists.json at once when it's been asked before, offline too), and isn't
+// there when the shelf has none. One clicked is pulled out in this one's place; one the shelf isn't showing (SHOW, the
+// filter) goes straight on the tray.
+function similarRow(a) {
+  const row = el('div', { class: 'case-similar', hidden: true });
+  if (!a.artist) return row;
+  similar.get(a.artist).then((list) => {
+    const found = similarOnShelf(a, shelf.albums, list);
+    if (!found.length || !row.isConnected) return;
+    row.replaceChildren(el('span', { class: 'similar-label' }, t('IF YOU LIKE THIS')), ...found.map(similarButton));
+    row.hidden = false;
+  }).catch(() => {});
+  return row;
+}
+function similarButton(b) {
+  const thumb = el('span', { class: 'thumb' });
+  coverFor(b, { online: false }).then((url) => { if (url) thumb.style.backgroundImage = `url("${url}")`; }).catch(() => {});
+  return el('button', { class: 'case-similar-album', title: [b.artist, b.title, b.year].filter(Boolean).join(' · '), onClick: () => {
+    const spine = spineOf(b);
+    closeCase(true);
+    if (!spine) { play(b, 0); return; }
+    spine.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+    openCase(b, spine);
+  } }, thumb, el('span', { class: 'words' }, el('span', {}, b.title), el('span', { class: 'by' }, b.artist)));
+}
+
+/**
+ * PLAY SIMILAR TO (the search): an album of yours like the one playing — of the likest twenty, the dustier the likelier,
+ * as FILL picks — onto the tray. The album playing found on the shelf by the song's path, else by the artist named.
+ */
+export async function playSimilarTo(app, path, artist) {
+  shelf.app = shelf.app || app;
+  const albums = shelf.albums.length ? shelf.albums : (((await app.cdp.shelfAlbums().catch(() => null)) || {}).albums || []);
+  const here = albums.find((a) => holds(a, path));
+  const who = (here && here.artist) || artist;
+  const pool = who ? similarPool(who, albums, await similar.get(who)).slice(0, 20).map((p) => p.album) : [];
+  const pick = pool.length ? pickOne(pool) : null;
+  if (!pick) { app.setStatus(t('NOTHING LIKE IT ON YOUR SHELF YET')); return; }
+  if (shelf.open) closeShelf();
+  app.insertDisc(pick.tracks.map((tr) => tr.path), { status: t('{disc} ON THE TRAY', { disc: pick.title.toUpperCase() }), disc: discOfAlbum(pick) });
+}
+
+// An album with other editions on the shelf: a button for each, the one out lit; another one's case takes its place.
+function editionButtons(a, spine) {
+  const editions = (spine.album && spine.album.editions) || null;
+  if (!editions || !editions.includes(a)) return [];
+  return editions.map((e) => {
+    const name = editionName(e, editions) || t('STANDARD|edition');
+    const b = pill(name.toLocaleUpperCase(), () => { if (e === a) return; closeCase(true); openCase(e, spine); },
+      `${e.title}${e.year ? ` · ${e.year}` : ''} · ${e.tracks.length === 1 ? t('1 TRACK') : t('{n} TRACKS', { n: e.tracks.length })}`);
+    b.classList.add('edition');
+    b.classList.toggle('on', e === a);
+    return b;
+  });
+}
+
+// The user's own divider cards (SORT: MY DIVIDERS, and SHOW): the case's button files the album behind one — one there
+// is, or a new one named on the spot — or takes it out from behind its own. The shelf stands anew once the case is back.
+const dividerNames = () => [...new Map(shelf.albums.filter((a) => a.filedUnder).map((a) => [a.filedUnder.toLocaleUpperCase(), a.filedUnder])).values()]
+  .sort((x, y) => x.localeCompare(y));
+function dividerButton(a, spine) {
+  // (an album's editions stand behind one spine: they're filed together, where any of them is)
+  const together = spine.album && spine.album.editions && spine.album.editions.includes(a) ? spine.album.editions : [a];
+  const filed = () => together.map((e) => e.filedUnder).find(Boolean) || null;
+  const label = () => (filed() ? `▮ ${filed().toLocaleUpperCase()}` : t('+ DIVIDER'));
+  const fileUnder = (name) => {
+    for (const e of together) {
+      e.filedUnder = name || null;
+      shelf.app.cdp.setDivider(e.id, e.filedUnder).catch(() => {});
+    }
+    button.textContent = label();
+    shelf.refiled = true;
+  };
+  // NEW DIVIDER…: its name typed where the button was; Enter files it, Esc (or leaving it empty) changes nothing.
+  const nameIt = () => {
+    const field = el('input', { class: 'text-input divider-name', type: 'text', maxlength: '30', placeholder: t('Divider name'), spellcheck: 'false' });
+    let finished = false; // (taking the field away blurs it: that mustn't save what Esc threw away)
+    const done = (save) => {
+      if (finished) return;
+      finished = true;
+      const typed = field.value.trim();
+      field.replaceWith(button);
+      // A name there is already, in another case ("for the car"), is that one.
+      if (save && typed) fileUnder(dividerNames().find((n) => n.toLocaleUpperCase() === typed.toLocaleUpperCase()) || typed);
+    };
+    field.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter' && !e.isComposing) done(true);
+      if (e.key === 'Escape') { e.preventDefault(); done(false); }
+    });
+    field.addEventListener('blur', () => done(true));
+    button.replaceWith(field);
+    field.focus();
+  };
+  const button = pill(label(), () => {
+    const names = dividerNames();
+    if (!names.length) { nameIt(); return; }
+    const same = (n) => !!filed() && n.toLocaleUpperCase() === filed().toLocaleUpperCase();
+    shelf.app.menu(button, [
+      ...names.map((n) => ({ label: n.toLocaleUpperCase(), current: same(n), pick: () => { if (!same(n)) fileUnder(n); } })),
+      { divider: true },
+      { label: t('NEW DIVIDER…'), pick: nameIt },
+      ...(filed() ? [{ label: t('TAKE IT FROM BEHIND “{name}”', { name: filed().toLocaleUpperCase() }), pick: () => fileUnder(null) }] : []),
+    ]);
+  }, t('File the album behind a divider of your own: SORT → MY DIVIDERS stands the shelf by them, SHOW shows one'));
+  return button;
+}
+
+// A case pulled out of the shelf: slides up off it, then turns towards you from its spine to its front.
+function showCase(card, spine, from, color) {
+  const layer = el('div', { class: 'case-layer', onClick: (e) => { if (e.target === layer) closeCase(); } }, card);
+  card.style.setProperty('--spine', `${color[0]}, ${color[1]}, ${color[2]}`);
+  $('shelf').append(layer);
+  shelf.caseOpen = { layer, card, spine };
+  spine.classList.add('out');
+  if (!anim.enabled) return;
+  const to = card.getBoundingClientRect();
+  const sx = from.width / to.width, sy = from.height / to.height;
+  card.animate([
+    { transform: `translate(${from.left - to.left}px, ${from.top - to.top - 30}px) scale(${sx}, ${sy}) rotateY(75deg)`, opacity: 0.2, transformOrigin: 'left top' },
+    { transform: 'none', opacity: 1, transformOrigin: 'left top' },
+  ], { duration: 460, easing: EASE.out });
+  // (into the dim it keeps after: a light theme's is a soft grey, not the dark one's black)
+  if (theme.light) { const dim = getComputedStyle(layer).backgroundColor; layer.animate([{ background: dim.startsWith('rgba') ? dim.replace(/[\d.]+\)$/, '0)') : 'transparent' }, { background: dim }], { duration: 360, easing: EASE.out }); }
+  else layer.animate([{ background: 'rgba(0,0,0,0)' }, { background: 'rgba(0,0,0,.6)' }], { duration: 360, easing: EASE.out });
+}
+
+// The disc's own picture (main: online.findDiscArt, kept once found), as a data URL — or null.
+const discArtOf = (a) => (a.artist && a.title ? shelf.app.cdp.discArt({ artist: a.artist, album: a.title, releaseId: a.mbReleaseId }).catch(() => null) : Promise.resolve(null));
+
+// The album's booklet, rising out of the case's cover (full size, not the spine's thumbnail).
+async function openAlbumBooklet(a, front, wholeList = null, lid = null) {
+  const { app } = shelf;
+  if (isBookletOpen() || front.classList.contains('opening')) return;
+  front.classList.add('opening');
+  try {
+    const src = (await app.cdp.shelfCoverFull(a.tracks[0].path).catch(() => null)) || (await coverFor(a));
+    let img = null;
+    if (src) { img = new Image(); img.src = src; try { await img.decode(); } catch { img = null; } }
+    const content = await albumBooklet(app, a, img, {
+      wholeList,
+      play: (i) => { closeBooklet(); play(a, i); },
+      onClose: () => { if (!lid) front.style.visibility = ''; },
+    });
+    if (!shelf.caseOpen || shelf.caseOpen.card !== front.closest('.case-card')) return; // put back while it loaded
+    const from = lid ? lid.rect : front.getBoundingClientRect();
+    if (!lid) front.style.visibility = 'hidden'; // it's the booklet's front cover now
+    await openBooklet(app, from, content, lid);
+  } finally { front.classList.remove('opening'); }
+}
+
+function closeCase(instant = false) {
+  const c = shelf.caseOpen;
+  if (!c) return;
+  shelf.caseOpen = null;
+  c.spine.classList.remove('out');
+  // Filed behind another divider: the shelf stands anew, where that shows.
+  if (shelf.refiled) { shelf.refiled = false; if (shelf.app.state.shelfSort === 'MINE' || shelf.show.startsWith('F')) redraw.request(); }
+  if (instant || !anim.enabled) { c.layer.remove(); return; }
+  c.card.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.94) rotateY(-20deg)' }], { duration: 220, easing: EASE.in });
+  c.layer.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 230, easing: EASE.in }).onfinish = () => c.layer.remove();
+}
+
+// PLAY: the album goes into the player as a disc (from track `from`, when a track in the list was clicked).
+function play(a, from) {
+  const paths = a.tracks.map((t) => t.path);
+  closeShelf();
+  shelf.app.insertDisc(paths, { start: from, status: t('{disc} ON THE TRAY', { disc: a.title.toUpperCase() }), disc: discOfAlbum(a) });
+}
+
+// ---- Discogs (main/discogs.js): the pressing on the case, the shelf appraised -------------------------------------
+
+const attachPressings = () => { for (const a of shelf.albums) a.pressing = shelf.pressings.get(a.id); };
+const albumQuery = (a) => ({ id: a.id, artist: a.artist, title: a.title, year: a.year, barcode: a.barcode, catalog: a.catalog, label: a.label, mbReleaseId: a.mbReleaseId });
+function markSpine(id) {
+  const spine = [...document.querySelectorAll('#shelf-body .spine')].find((s) => s.album && s.album.id === id);
+  if (spine) spine.classList.toggle('rare', isRare(spine.album.pressing));
+}
+function renderCount() {
+  if (!shelf.loading) $('shelf-count').textContent = [shelf.saying || shelf.countBase, shelf.appraisalNote].filter(Boolean).join(' · ');
+}
+// News while the shelf is open: the player's status line is under it, so it's said in the shelf's own line too, a while.
+function say(text) {
+  shelf.app.setStatus(text);
+  shelf.saying = text; renderCount();
+  clearTimeout(shelf.sayTimer);
+  shelf.sayTimer = setTimeout(() => { shelf.saying = null; renderCount(); }, 5000);
+}
+
+// The case's PRESSING: what's known at once, then Discogs' answer as the case comes out.
+function pressingBlock(a, rare, onEntry) {
+  const box = el('div', { class: 'case-pressing' });
+  const show = (entry) => {
+    rare.hidden = !isRare(entry);
+    if (entry && !entry.error) onEntry(entry); // the receipt's and the price tag's price
+    if (entry && entry.error) { box.replaceChildren(el('div', { class: 'pressing-line' }, t('DISCOGS UNAVAILABLE'))); return; }
+    if (!entry || !entry.releaseId) {
+      box.replaceChildren(el('div', { class: 'pressing-line' }, t('NOT ON DISCOGS')),
+        el('div', { class: 'row-pills' }, pill(t('CHOOSE PRESSING…'), (e) => choosePressing(a, e.currentTarget, null, show), t('Pick it from a Discogs search'))));
+      return;
+    }
+    const other = entry.info.masterId ? pill(t('OTHER PRESSING…'), (e) => choosePressing(a, e.currentTarget, entry.info.masterId, show), t('Another pressing of this album')) : null;
+    box.replaceChildren(
+      el('div', { class: 'pressing-head' }, t('PRESSING')),
+      el('div', { class: 'pressing-line' }, pressingLine(entry.info)),
+      el('div', { class: 'pressing-line market' }, marketLine(entry)),
+      el('div', { class: 'row-pills' }, pill(t('DISCOGS'), () => shelf.app.cdp.openDiscogs(entry.info.uri), t('Open it on Discogs')), other));
+  };
+  const known = shelf.pressings.get(a.id);
+  if (known) show(known); else box.replaceChildren(el('div', { class: 'pressing-line' }, t('LOOKING ON DISCOGS…')));
+  shelf.app.cdp.discogsLookup(albumQuery(a)).then((entry) => {
+    if (entry && !entry.error) { shelf.pressings.set(a.id, entry); a.pressing = entry; markSpine(a.id); }
+    if (entry && (!entry.error || !known)) show(entry);
+  });
+  return box;
+}
+
+/** OTHER PRESSING… (the master's CD pressings) or CHOOSE PRESSING… (a Discogs search): a menu; the pick is kept. */
+export async function choosePressing(a, anchor, masterId, onChosen = () => {}) {
+  const box = anchor.getBoundingClientRect();
+  const list = masterId ? await shelf.app.cdp.discogsVersions(masterId) : await shelf.app.cdp.discogsSearch(albumQuery(a));
+  if (!Array.isArray(list) || !list.length) {
+    const why = list && list.error ? t('DISCOGS UNAVAILABLE') : t('NOTHING FOUND ON DISCOGS');
+    say(why);
+    // …and on the button pressed, where the eyes are.
+    if (anchor.isConnected && !anchor.dataset.label) { anchor.dataset.label = anchor.textContent; anchor.textContent = why; setTimeout(() => { anchor.textContent = anchor.dataset.label; delete anchor.dataset.label; }, 3000); }
+    return;
+  }
+  shelf.app.menu(box, list.map((v) => ({
+    label: [masterId ? null : v.title, v.label, v.catno, v.country, v.year, v.format].filter(Boolean).join(' · '),
+    pick: async () => {
+      const entry = await shelf.app.cdp.discogsChoose(albumQuery(a), v.id);
+      if (!entry || entry.error) { say(t('DISCOGS UNAVAILABLE')); return; }
+      shelf.pressings.set(a.id, entry);
+      const onShelf = shelf.albums.find((x) => x.id === a.id);
+      if (onShelf) onShelf.pressing = entry;
+      markSpine(a.id);
+      onChosen(entry);
+    },
+  })));
+}
+
+// APPRAISE: every album's price, one after another (main/discogs.js keeps to Discogs' pace); STOP stops it.
+async function appraise() {
+  shelf.settings = await shelf.app.cdp.discogsSettings().catch(() => shelf.settings); // the currency may have changed
+  shelf.appraising = { done: 0, total: shelf.albums.length };
+  updateAppraiseCount();
+  const result = await shelf.app.cdp.discogsAppraise(shelf.albums.map(albumQuery));
+  shelf.appraising = { ...result, finished: true };
+  if (!result.stopped && !result.error) shelf.appraised = true;
+  if (result.error) say(t('APPRAISAL STOPPED · NO CONNECTION'));
+  else if (result.skipped) say(t('APPRAISED · DISCOGS COULDN’T ANSWER FOR {n}', { n: result.skipped }));
+  else if (!result.stopped && !totalNote()) say(t('APPRAISED · NONE OF THESE ARE ON DISCOGS')); // (not a silent end)
+  updateAppraiseCount();
+  if (shelf.open) render();
+}
+function updateAppraiseCount() {
+  const p = shelf.appraising, running = p && !p.finished;
+  $('shelf-appraise').textContent = running ? (p.stopping ? t('STOPPING…') : t('STOP')) : t('APPRAISE');
+  shelf.appraisalNote = running ? t('APPRAISING · {done} / {total}', { done: p.done, total: p.total }) : totalNote();
+  renderCount();
+}
+function totalNote() {
+  const currency = (shelf.settings && shelf.settings.currency) || 'USD';
+  const { value, count } = shelfTotal(shelf.albums.map((a) => a.pressing), currency);
+  if (!count) return null;
+  // Only some priced yet: says how many, so a few albums' worth isn't taken for the whole shelf's.
+  return count < shelf.albums.length ? t('{n} OF {total} PRICED ≈ {value}', { n: count, total: shelf.albums.length, value: money(value, currency) })
+    : t('THE SHELF ≈ {value}', { value: money(value, currency) });
+}
+
+// ---- SHELFIE (shelfie.js): the shelf as it stands, taken off the screen ---------------------------------------------
+
+const frames = (n = 2) => new Promise((resolve) => { const go = () => (--n ? requestAnimationFrame(go) : setTimeout(resolve, 90)); requestAnimationFrame(go); });
+/**
+ * The shelf's rows as pictures, for SHARE: the shelf opened if it isn't, the case put back, then each band of rows
+ * scrolled into view and taken off the screen (main's capturePage) a window's height at a time, and stitched — while
+ * anything over the shelf (the search it was asked from) is out of sight and no spine lifts under the mouse. The
+ * shelf scrolls back to where it was. → null with nothing on it; else { crops, bands, heading, line, scale }, each crop
+ * cut from the band that holds it (shelfie.js's cutRows).
+ */
+export async function takeShelfie(app) {
+  if (!shelf.open) await openShelf(app);
+  // (still being read, or read but its rows not laid out yet — a phone takes a second or two after the shelf opens)
+  for (let i = 0; i < 80 && (shelf.loading || !$('shelf-body').querySelector('.shelf-rows')); i++) await new Promise((r) => setTimeout(r, 100));
+  closeBooklet(); closeCase(true);
+  const body = $('shelf-body');
+  let rows = body.querySelector('.shelf-rows');
+  if (!shelf.open || !rows || !shelf.shown || !shelf.shown.length) return null;
+  const root = $('shelf');
+  // (the spines still rising onto a shelf just opened, the shelf still growing out of its button)
+  await Promise.race([Promise.all(root.getAnimations({ subtree: true }).map((a) => a.finished.catch(() => {}))), new Promise((r) => setTimeout(r, 1500))]);
+  // (and settled: on a slow phone the shelf is laid out again a moment after it opens, its rows a new element — taken
+  // anew each time, until the same size three times running, 120 ms apart; "ROW 1 OF 1" from the old one otherwise)
+  for (let i = 0, same = 0, was = ''; i < 40 && same < 3; i++) {
+    rows = body.querySelector('.shelf-rows') || rows;
+    const now = `${body.clientHeight}x${rows.offsetHeight}`;
+    same = now === was && body.clientHeight > 0 ? same + 1 : 0; was = now;
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  rows = body.querySelector('.shelf-rows') || rows;
+  const start = body.scrollTop;
+  const rowsTop = Math.round(rows.getBoundingClientRect().top - body.getBoundingClientRect().top - body.clientTop + start);
+  const count = Math.max(1, Math.round(rows.offsetHeight / ROW));
+  const crops = shelfieCrops({ rows: count, first: Math.max(0, Math.round((start - rowsTop + ROW_ABOVE) / ROW)), inView: Math.max(1, Math.floor((body.clientHeight - ROW_ABOVE + 8) / ROW)) });
+  root.classList.add('shooting'); document.body.classList.add('shelfie-shooting');
+  say(t('TAKING THE PICTURE…'));
+  const bands = [];
+  try {
+    const grab = async (from, n) => {
+      const y0 = rowsTop + from * ROW - ROW_ABOVE, y1 = rowsTop + (from + n) * ROW + ROW_BELOW, w = body.clientWidth;
+      const parts = [];
+      for (let y = y0; y < y1;) {
+        body.scrollTop = y;
+        await frames();
+        const box = body.getBoundingClientRect(), at = Math.round(body.scrollTop);
+        const top = Math.max(y, at), bottom = Math.min(y1, at + body.clientHeight);
+        if (bottom <= top) break;
+        const png = await app.cdp.capture({ x: Math.round(box.left + body.clientLeft), y: Math.round(box.top + body.clientTop) + top - at, width: w, height: bottom - top });
+        parts.push({ at: top - y0, height: bottom - top, image: await createImageBitmap(new Blob([png], { type: 'image/png' })) });
+        y = bottom;
+      }
+      if (!parts.length) return null;
+      const scale = parts[0].image.width / w, canvas = new OffscreenCanvas(Math.round(w * scale), Math.round((y1 - y0) * scale));
+      const g = canvas.getContext('2d');
+      for (const p of parts) { g.drawImage(p.image, 0, Math.round(p.at * scale), canvas.width, Math.round(p.height * scale)); p.image.close(); }
+      return { from, count: n, scale, canvas };
+    };
+    const whole = crops[crops.length - 1];
+    bands.push(await grab(0, whole.count));
+    const view = crops[0];
+    if (view.from + view.count > whole.count) bands.push(await grab(view.from, view.count));
+  } finally {
+    body.scrollTop = start;
+    root.classList.remove('shooting'); document.body.classList.remove('shelfie-shooting');
+    shelf.saying = null; renderCount();
+  }
+  if (!bands[0]) return null;
+  // What it shows, over it: THE SHELF, or what SHOW picks and what's searched for.
+  const query = $('shelf-filter').value.trim();
+  const heading = [t('MY SHELF'), shelf.show !== 'ALL' ? shelf.showLabel : null, query ? `“${query}”` : null].filter(Boolean).join(' · ');
+  const line = shelfieLine(shelf.shown, { complete: completeCount(shelf.shown, shelf.albums, shelf.discogs, shelf.hidden), currency: (shelf.settings && shelf.settings.currency) || 'USD' });
+  const sort = shelf.app.state.shelfSort;
+  return { crops: crops.map((c) => ({ ...c, band: bands.find((b) => b && c.from >= b.from && c.from + c.count <= b.from + b.count) })).filter((c) => c.band),
+    heading, line, scale: bands[0].scale, sorted: t('SORTED BY {sort}', { sort: SORT_LABELS[sort] || sort }), rows: count };
+}
+
+/** The ids of the albums on the shelf (null before it's been read): Library Check lists only these as not on Discogs. */
+export const shelfAlbumIds = () => (shelf.albums.length ? shelf.albums.map((a) => a.id) : null);
+/** Settings → DISCOGS → CURRENCY changed: prices are asked again in it at the next appraisal, and the shelf reshown. */
+export async function discogsCurrencyChanged() {
+  shelf.settings = await shelf.app.cdp.discogsSettings().catch(() => shelf.settings);
+  shelf.appraised = false;
+  shelf.appraisalNote = totalNote();
+  if (shelf.open) render();
+}

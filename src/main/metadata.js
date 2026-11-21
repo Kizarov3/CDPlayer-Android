@@ -1,0 +1,225 @@
+'use strict';
+/**
+ * Tag, cover-art and lyrics reading via music-metadata (pure JavaScript — ID3v1/v2, MP4 atoms, Vorbis comments,
+ * FLAC, APE, AIFF/WAV chunks). This is what replaced the Java version's ffprobe/ffmpeg subprocess calls.
+ */
+const path = require('path');
+const { nativeImage } = require('electron');
+const cue = require('./cue');
+const streaming = require('./streaming');
+const audioCd = require('./audio-cd');
+const winCd = require('./win-cd');
+const { describeFormat } = require('./audio-format');
+const { cleanTrackName, tidyNames, isJunkTitle } = require('./track-names');
+const { t } = require('./i18n');
+
+// The small print for the booklet's credits page and back cover — only the tags a file actually has.
+function creditsFrom(c) {
+  const first = (v) => (Array.isArray(v) ? v.filter(Boolean).join(', ') : v) || null;
+  const out = {
+    albumArtist: first(c.albumartist), albumArtistMbid: first(c.musicbrainz_albumartistid), albumMbid: first(c.musicbrainz_albumid), released: first(c.date) || (c.year ? String(c.year) : null),
+    genre: first(c.genre), composer: first(c.composer), lyricist: first(c.lyricist), producer: first(c.producer),
+    conductor: first(c.conductor), label: first(c.label), catalog: first(c.catalognumber), barcode: first(c.barcode),
+    copyright: first(c.copyright), bpm: c.bpm ? Math.round(c.bpm) : null,
+    track: c.track && c.track.no ? c.track : null, disc: c.disk && c.disk.no && (c.disk.of > 1 || c.disk.no > 1) ? c.disk : null,
+  };
+  for (const k of Object.keys(out)) if (out[k] == null || out[k] === '') delete out[k];
+  return out;
+}
+
+let mmPromise = null;
+const mm = () => (mmPromise ||= import('music-metadata'));
+
+class Lru {
+  constructor(limit) { this.limit = limit; this.map = new Map(); }
+  get(key) {
+    if (!this.map.has(key)) return undefined;
+    const v = this.map.get(key); this.map.delete(key); this.map.set(key, v); return v;
+  }
+  set(key, value) {
+    this.map.delete(key); this.map.set(key, value);
+    while (this.map.size > this.limit) this.map.delete(this.map.keys().next().value);
+  }
+  delete(key) { this.map.delete(key); }
+}
+
+// Details (small) are cached generously; decoded cover images (large) are cached separately and more tightly —
+// the same unbounded-growth concern the Java version's bounded LRU was written for.
+const detailsCache = new Lru(500);
+const coverCache = new Lru(24);
+const inflight = new Map();
+
+function displayName(filePath) {
+  return path.basename(filePath).replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
+}
+function fallbackTitle(filePath) {
+  return displayName(filePath).replace(/^\s*\d{1,3}[ ._-]+/, '');
+}
+
+function formatLrcTimestamp(ms) {
+  const total = Math.max(0, ms) / 1000;
+  const m = Math.floor(total / 60), s = total - m * 60;
+  return `[${String(m).padStart(2, '0')}:${s.toFixed(2).padStart(5, '0')}]`;
+}
+
+// music-metadata reports lyrics as tag objects (plain text and/or SYLT-style synced lines). Synced lines are turned
+// into LRC text so the Lyrics panel's single parser handles embedded synced lyrics and lrclib.net results alike.
+function extractLyrics(common) {
+  const list = common.lyrics || [];
+  for (const entry of list) {
+    if (typeof entry === 'string' && entry.trim()) return entry.trim();
+    if (entry && Array.isArray(entry.syncText) && entry.syncText.length) {
+      return entry.syncText.map((l) => `${formatLrcTimestamp(l.timestamp || 0)}${l.text || ''}`).join('\n');
+    }
+    if (entry && typeof entry.text === 'string' && entry.text.trim()) return entry.text.trim();
+  }
+  return null;
+}
+
+// Very large embedded artwork (3000px PNGs are common) is scaled down once here, instead of shipping megabytes
+// over IPC and re-decoding it on every repaint.
+function coverToDataUrl(picture) {
+  try {
+    let img = nativeImage.createFromBuffer(Buffer.from(picture.data));
+    if (img.isEmpty()) return null;
+    const { width, height } = img.getSize();
+    if (Math.max(width, height) > 1024) img = img.resize(width >= height ? { width: 1024, quality: 'best' } : { height: 1024, quality: 'best' });
+    return `data:image/jpeg;base64,${img.toJPEG(90).toString('base64')}`;
+  } catch { return null; }
+}
+
+async function parse(filePath, { covers }) {
+  const { parseFile } = await mm();
+  let meta = await parseFile(filePath, { skipCovers: !covers, duration: false });
+  // A CBR/VBR MP3 without a Xing/VBRI header has no stored duration — scanning the frames is the only way to know.
+  if (!meta.format.duration && /\.mp3$/i.test(filePath)) {
+    meta = await parseFile(filePath, { skipCovers: !covers, duration: true });
+  }
+  return meta;
+}
+
+// A cue sheet track: its own title/performer from the sheet, and the cover, format and length of the album file it's
+// a stretch of. `cue` tells the player which file to play and from/to where (null: the track couldn't be found).
+async function getCueTrackDetails(ref, withCover) {
+  const track = await cue.resolveRef(ref);
+  const { cuePath, number } = cue.parseRef(ref);
+  const fallback = `${displayName(cuePath)} · Track ${number}`;
+  if (!track) return { path: ref, title: fallback, artist: null, album: null, lyrics: null, duration: 0, ext: 'CUE', quality: 'CUE', format: null, cue: null, cover: withCover ? null : undefined };
+  const file = await getDetails(track.file, { withCover });
+  const end = track.end !== null ? track.end : file.duration;
+  return {
+    ...file,
+    path: ref,
+    title: track.title || `Track ${number}`,
+    artist: track.performer || file.artist,
+    album: track.album || file.album,
+    lyrics: null, // embedded lyrics belong to the whole album file, not this track
+    duration: Math.max(0, end - track.start),
+    cue: { file: track.file, start: track.start, end: track.end },
+  };
+}
+
+// A Windows audio-CD track (cdda://): nothing to read from a file — its length from the disc's table of contents,
+// its name from MusicBrainz (below) or else "Track N".
+function cdTrackDetails(p, info, { withCover = true } = {}) {
+  return {
+    path: p, title: t('Track {n}', { n: info.number }), artist: null, nameGuessed: false, unnamed: true, credits: {}, album: null,
+    lyrics: null, duration: info.duration, ext: 'CDA', quality: 'CD AUDIO · 16-BIT · 44.1 KHZ', format: { sampleRate: 44100, bitsPerSample: 16, lossless: true }, replayGain: null, cover: withCover ? null : undefined,
+  };
+}
+
+// Sound Check: a file's ReplayGain tags (dB to -18 LUFS, peaks linear), or an Opus/Vorbis file's R128 gains — Q7.8 dB
+// to -23 LUFS, so 5 dB more. → null when it has none.
+function replayGainFrom(meta) {
+  const c = meta.common || {}, num = (v) => (Number.isFinite(v) ? v : null);
+  const out = {
+    trackGain: num(c.replaygain_track_gain && c.replaygain_track_gain.dB), trackPeak: num(c.replaygain_track_peak && c.replaygain_track_peak.ratio),
+    albumGain: num(c.replaygain_album_gain && c.replaygain_album_gain.dB), albumPeak: num(c.replaygain_album_peak && c.replaygain_album_peak.ratio),
+  };
+  for (const tags of Object.values(meta.native || {})) {
+    for (const { id, value } of tags) {
+      const q = parseInt(value, 10);
+      if (!Number.isFinite(q)) continue;
+      if (/^R128_TRACK_GAIN$/i.test(id) && out.trackGain === null) out.trackGain = q / 256 + 5;
+      if (/^R128_ALBUM_GAIN$/i.test(id) && out.albumGain === null) out.albumGain = q / 256 + 5;
+    }
+  }
+  return Object.values(out).some((v) => v !== null) ? out : null;
+}
+
+/** A track's details: its tags, cover and lyrics — and for a track of an audio CD, the names the disc was looked up by. */
+async function getDetails(filePath, opts = {}) {
+  if (streaming.isStreamPage(filePath)) return streaming.details(filePath, opts);
+  const onDisc = winCd.trackInfo(filePath);
+  const details = onDisc ? cdTrackDetails(filePath, onDisc, opts) : await readDetails(filePath, opts);
+  const cd = audioCd.detailsFor(filePath);
+  if (!cd) return details;
+  const credits = { ...details.credits, albumArtist: cd.albumArtist || undefined, released: cd.year || undefined, track: { no: cd.track, of: cd.of }, disc: cd.disc ? { no: cd.disc, of: null } : undefined };
+  for (const k of Object.keys(credits)) if (credits[k] == null) delete credits[k];
+  return {
+    ...details, title: cd.title, artist: cd.artist, album: cd.album, nameGuessed: false, unnamed: false, credits,
+    cover: opts.withCover === false ? undefined : cd.cover || details.cover,
+  };
+}
+async function readDetails(filePath, { withCover = true } = {}) {
+  if (cue.parseRef(filePath)) return getCueTrackDetails(filePath, withCover);
+  const cached = detailsCache.get(filePath);
+  if (cached && (!withCover || coverCache.get(filePath) !== undefined)) {
+    return { ...cached, cover: withCover ? coverCache.get(filePath) : undefined };
+  }
+  const key = `${filePath}\0${withCover}`;
+  if (inflight.has(key)) return inflight.get(key);
+  const job = (async () => {
+    let title = null, artist = null, album = null, lyrics = null, duration = 0, cover = null, format = null, credits = {}, replayGain = null;
+    try {
+      const meta = await parse(filePath, { covers: withCover });
+      const c = meta.common;
+      title = c.title || null;
+      artist = c.artist || (c.artists && c.artists[0]) || null;
+      album = c.album || null;
+      lyrics = extractLyrics(c);
+      credits = creditsFrom(c);
+      duration = meta.format.duration || 0;
+      format = meta.format;
+      replayGain = replayGainFrom(meta);
+      if (withCover && c.picture && c.picture.length) {
+        const front = c.picture.find((p) => /front/i.test(p.type || '')) || c.picture[0];
+        cover = coverToDataUrl(front);
+      }
+    } catch { /* unreadable tags are normal — fall back to the filename, same as the Java version */ }
+    // Untagged or badly tagged: the filename fills in, read as "Artist - Title" when it's named that way, and website
+    // tags ("(mp3.pm)"), video-site noise, junk artists ("Unknown Artist") and track numbers come off — so the name
+    // reads properly and the cover and lyrics lookups search for the real song (track-names.js).
+    const names = tidyNames({ artist, title }, filePath);
+    const details = {
+      path: filePath,
+      title: names.title || fallbackTitle(filePath),
+      artist: names.artist,
+      nameGuessed: names.guessed,
+      // Only a name like "6 Audio Track" (an unknown CD's track) or "Untitled": nothing to look the song up by.
+      unnamed: !names.artist && isJunkTitle(names.title || fallbackTitle(filePath)),
+      credits,
+      album: cleanTrackName(album && album.trim() ? album.trim() : null) || null,
+      lyrics,
+      duration,
+      ext: path.extname(filePath).slice(1).toUpperCase(),
+      quality: describeFormat(format, path.extname(filePath).slice(1).toUpperCase()),
+      format: format ? {
+        sampleRate: format.sampleRate || null,
+        bitsPerSample: format.bitsPerSample || null,
+        lossless: !!format.lossless || /^(FLAC|ALAC|WAV|AIFF|AIF)$/i.test(path.extname(filePath).slice(1)) || /alac|flac/i.test(String(format.codec || '')),
+      } : null,
+      replayGain,
+    };
+    detailsCache.set(filePath, details);
+    if (withCover) coverCache.set(filePath, cover);
+    return { ...details, cover: withCover ? cover : undefined };
+  })();
+  inflight.set(key, job);
+  try { return await job; } finally { inflight.delete(key); }
+}
+
+/** The file's tags changed (they were just written): read them again next time. */
+function forget(filePath) { detailsCache.delete(filePath); coverCache.delete(filePath); }
+
+module.exports = { getDetails, forget, displayName, fallbackTitle, extractLyrics, Lru };

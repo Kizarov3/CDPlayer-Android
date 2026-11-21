@@ -1,0 +1,325 @@
+'use strict';
+// Grouping tracks into the albums on the shelf (no files or network).
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdplayer-test-'));
+process.env.CDPLAYER_HOME = home; // never touch a real ~/.cdplayer
+const { groupAlbums } = require('../src/main/shelf');
+test.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+const t = (p, info) => ({ path: p, info: { title: path.basename(p), artist: null, album: null, albumArtist: null, year: null, track: null, disc: 1, duration: 60, ...info } });
+
+test('tracks of one album, in disc and track order, across CD1/CD2 folders', () => {
+  const albums = groupAlbums([
+    t('/m/Korn/FtL/CD2/01.flac', { album: 'Follow the Leader', artist: 'Korn', albumArtist: 'Korn', disc: 2, track: 1, year: '1998' }),
+    t('/m/Korn/FtL/CD1/02.flac', { album: 'Follow the Leader', artist: 'Korn', albumArtist: 'Korn', disc: 1, track: 2, year: '1998' }),
+    t('/m/Korn/FtL/CD1/01.flac', { album: 'Follow the Leader', artist: 'Korn', albumArtist: 'Korn', disc: 1, track: 1, year: '1998-08-18' }),
+  ]);
+  assert.strictEqual(albums.length, 1);
+  const [a] = albums;
+  assert.deepStrictEqual(a.tracks.map((x) => x.path), ['/m/Korn/FtL/CD1/01.flac', '/m/Korn/FtL/CD1/02.flac', '/m/Korn/FtL/CD2/01.flac']);
+  assert.strictEqual(a.discs, 2);
+  assert.strictEqual(a.artist, 'Korn');
+  assert.strictEqual(a.folder, '/m/Korn/FtL');
+  assert.strictEqual(a.duration, 180);
+});
+
+test('same album name by different artists in different folders stays apart; a compilation stays together', () => {
+  const albums = groupAlbums([
+    t('/m/a/1.mp3', { album: 'Greatest Hits', artist: 'Queen' }),
+    t('/m/b/1.mp3', { album: 'Greatest Hits', artist: 'ABBA' }),
+    t('/m/now/1.mp3', { album: 'Now 50', artist: 'Someone' }),
+    t('/m/now/2.mp3', { album: 'Now 50', artist: 'Someone Else' }),
+  ]);
+  assert.deepStrictEqual(albums.map((a) => `${a.artist} — ${a.title} (${a.tracks.length})`), [
+    'ABBA — Greatest Hits (1)', 'Queen — Greatest Hits (1)', 'Various Artists — Now 50 (2)',
+  ]);
+});
+
+test('untagged music is shelved by folder; sorting ignores a leading "The"', () => {
+  const albums = groupAlbums([
+    t('/m/Tapes/Summer Mix/b.mp3', {}), t('/m/Tapes/Summer Mix/a.mp3', {}),
+    t('/m/x/1.mp3', { album: 'Abbey Road', artist: 'The Beatles', year: '1969' }),
+    t('/m/y/1.mp3', { album: 'Blue', artist: 'Joni Mitchell', year: '1971' }),
+  ]);
+  assert.deepStrictEqual(albums.map((a) => a.title), ['Abbey Road', 'Blue', 'Summer Mix']);
+  assert.deepStrictEqual(albums[2].tracks.map((x) => path.basename(x.path)), ['a.mp3', 'b.mp3']);
+  assert.strictEqual(albums[2].artist, null);
+});
+
+test('one album whatever its punctuation, and a song without an album artist joins its album in the same folder', () => {
+  const dir = "/m/Limp Bizkit/Three Dollar Bill Y'All$";
+  const albums = groupAlbums([
+    t(`${dir}/01 Intro.m4a`, { album: 'Three Dollar Bill, Yall$', artist: 'Limp Bizkit', albumArtist: 'Limp Bizkit', track: 1 }),
+    t(`${dir}/02 Pollution.m4a`, { album: "Three Dollar Bill Y'All$", artist: 'Limp Bizkit', track: 2 }),
+    t(`${dir}/03 Counterfeit.m4a`, { album: "THREE DOLLAR BILL Y'ALL$", artist: 'Limp Bizkit', track: 3 }),
+  ]);
+  assert.strictEqual(albums.length, 1);
+  assert.deepStrictEqual(albums[0].tracks.map((x) => x.track), [1, 2, 3]);
+  assert.strictEqual(albums[0].artist, 'Limp Bizkit');
+});
+
+test('different albums stay apart: another folder without album artists, or a name that differs in more than punctuation', () => {
+  const albums = groupAlbums([
+    t('/m/lb/tdb/01.m4a', { album: 'Three Dollar Bill, Yall$', artist: 'Limp Bizkit', albumArtist: 'Limp Bizkit' }),
+    t('/m/other/01.m4a', { album: 'Three Dollar Bill Yall', artist: 'Cover Band' }),
+    t('/m/lb/cs/01.m4a', { album: 'Chocolate Starfish', artist: 'Limp Bizkit' }),
+  ]);
+  assert.strictEqual(albums.length, 3);
+});
+
+// ---- Covers found online, for albums with no art of their own ------------------------------------------------------
+
+const { onlineCover } = require('../src/main/shelf');
+const counting = (answer) => { const f = async (q) => { f.calls.push(q); return typeof answer === 'function' ? answer(q) : answer; }; f.calls = []; return f; };
+
+test('an album with no art of its own gets the cover found online, and it is remembered', async () => {
+  const find = counting({ cover: 'data:image/jpeg;base64,AAAA', source: 'ITUNES' });
+  const q = { artist: 'Radiohead', title: 'Airbag', album: 'OK Computer' };
+  assert.strictEqual(await onlineCover(q, { find }), 'data:image/jpeg;base64,AAAA');
+  assert.deepStrictEqual(find.calls, [q]);
+  assert.strictEqual(await onlineCover({ ...q, title: 'Lucky' }, { find }), 'data:image/jpeg;base64,AAAA', 'same album: no second search');
+  assert.strictEqual(find.calls.length, 1);
+});
+
+test('an album nobody has a cover for is not searched again for a week; a network failure is tried again', async () => {
+  const q = { artist: 'Nobody', title: 'Demo', album: 'Basement Tapes' };
+  const none = counting({ cover: null, source: null });
+  assert.strictEqual(await onlineCover(q, { find: none, now: 1000 }), null);
+  assert.strictEqual(await onlineCover(q, { find: none, now: 1000 + 86400e3 }), null);
+  assert.strictEqual(none.calls.length, 1);
+  await onlineCover(q, { find: none, now: 1000 + 8 * 86400e3 });
+  assert.strictEqual(none.calls.length, 2, 'asked again after a week');
+
+  const q2 = { artist: 'Offline', title: 'Song', album: 'Unplugged' };
+  const down = counting({ cover: null, source: null, networkError: true });
+  assert.strictEqual(await onlineCover(q2, { find: down }), null);
+  await onlineCover(q2, { find: down });
+  assert.strictEqual(down.calls.length, 2, 'a failed search is not remembered as "no cover"');
+});
+
+test('untagged music is never searched online', async () => {
+  const find = counting({ cover: 'data:image/jpeg;base64,BBBB' });
+  assert.strictEqual(await onlineCover({ artist: null, title: '01', album: null }, { find }), null);
+  assert.strictEqual(find.calls.length, 0);
+});
+
+test('covers remembered by the old song-based search are not trusted', async () => {
+  fs.writeFileSync(path.join(home, 'shelf-covers.json'), JSON.stringify({ 'limp bizkit\nthree dollar bill': { cover: 'data:image/jpeg;base64,WRONG' } }));
+  delete require.cache[require.resolve('../src/main/shelf')];
+  const fresh = require('../src/main/shelf');
+  const find = counting({ cover: 'data:image/jpeg;base64,RIGHT' });
+  assert.strictEqual(await fresh.onlineCover({ artist: 'Limp Bizkit', album: 'Three Dollar Bill' }, { find }), 'data:image/jpeg;base64,RIGHT');
+  assert.strictEqual(find.calls.length, 1);
+});
+
+test('when a track was first seen: kept from the cache even once its tags are rewritten; the file\'s date on a first scan', () => {
+  const { addedAt } = require('../src/main/shelf');
+  const now = Date.UTC(2026, 8, 28);
+  const st = { birthtimeMs: Date.UTC(2020, 0, 1), mtimeMs: Date.UTC(2026, 8, 27) }; // tags rewritten yesterday
+  assert.strictEqual(addedAt({ added: Date.UTC(2024, 4, 1) }, st, true, now), Date.UTC(2024, 4, 1));
+  assert.strictEqual(addedAt(undefined, st, false, now), Date.UTC(2020, 0, 1)); // no cache yet: not all NEW at once
+  assert.strictEqual(addedAt({ stamp: 'x' }, st, true, now), Date.UTC(2020, 0, 1)); // cached before `added` existed
+  assert.strictEqual(addedAt(undefined, { birthtimeMs: 0, mtimeMs: Date.UTC(2021, 0, 1) }, false, now), Date.UTC(2021, 0, 1)); // no birth time (Linux)
+  assert.strictEqual(addedAt(undefined, st, true, now), now); // a file that appears after the shelf was read: just added
+  assert.strictEqual(addedAt(undefined, null, true, now), null);
+});
+
+test('an album was added when its newest track was', () => {
+  const [a] = groupAlbums([
+    { ...t('/m/x/1.mp3', { album: 'A', artist: 'B' }), added: 100 },
+    { ...t('/m/x/2.mp3', { album: 'A', artist: 'B' }), added: 300 },
+    { ...t('/m/x/3.mp3', { album: 'A', artist: 'B' }), added: null },
+  ]);
+  assert.strictEqual(a.added, 300);
+  assert.strictEqual(groupAlbums([t('/m/y/1.mp3', { album: 'C' })])[0].added, null);
+});
+
+test('the tracks of the shelf album a song is on, from the shelf\'s cache; a song not on the shelf has none', () => {
+  const store = require('../src/main/store');
+  const music = fs.mkdtempSync(path.join(home, 'music-'));
+  store.writeMusicFolders([music]);
+  const info = (album, disc) => ({ title: 't', artist: 'Korn', album, albumArtist: 'Korn', year: '1998', track: 1, disc, duration: 60 });
+  const tracks = {
+    [`${music}/Korn/FtL/CD1/01.flac`]: { stamp: 'x', info: info('Follow the Leader', 1), added: 1 },
+    [`${music}/Korn/FtL/CD2/01.flac`]: { stamp: 'x', info: info('Follow the Leader', 2), added: 1 },
+    [`${music}/Korn/Issues/01.flac`]: { stamp: 'x', info: info('Issues', 1), added: 1 },
+  };
+  fs.writeFileSync(path.join(home, 'shelf-cache.json'), JSON.stringify({ version: 2, folder: music, tracks }));
+  delete require.cache[require.resolve('../src/main/shelf')];
+  const { albumTracks } = require('../src/main/shelf');
+  assert.deepStrictEqual(albumTracks(`${music}/Korn/FtL/CD2/01.flac`).sort(), [`${music}/Korn/FtL/CD1/01.flac`, `${music}/Korn/FtL/CD2/01.flac`]);
+  assert.deepStrictEqual(albumTracks(`${music}/Korn/Issues/01.flac`), [`${music}/Korn/Issues/01.flac`]);
+  assert.strictEqual(albumTracks('/Downloads/song.mp3'), null);
+});
+
+test('an album was last touched when it turned up, a song of it was played or it was wiped — or when dust began', () => {
+  const { touchedAt } = require('../src/main/shelf');
+  const album = { id: 'x', added: 100, tracks: [{ path: '/a' }, { path: '/b' }] };
+  const none = { lastPlayed: new Map(), wiped: new Map(), since: 50 };
+  assert.strictEqual(touchedAt(album, none), 100);
+  assert.strictEqual(touchedAt({ ...album, added: null }, none), 50);
+  assert.strictEqual(touchedAt(album, { ...none, lastPlayed: new Map([['/b', 400], ['/zzz', 9000]]) }), 400);
+  assert.strictEqual(touchedAt(album, { ...none, lastPlayed: new Map([['/b', 400]]), wiped: new Map([['x', 700]]) }), 700);
+});
+
+test('an album knows its album artist\'s MusicBrainz ID when a track\'s tags have it', () => {
+  const [a] = groupAlbums([
+    t('/m/r/ok/1.mp3', { album: 'OK Computer', artist: 'Radiohead', albumArtist: 'Radiohead' }),
+    t('/m/r/ok/2.mp3', { album: 'OK Computer', artist: 'Radiohead', albumArtist: 'Radiohead', artistMbid: 'a74b1b7f' }),
+  ]);
+  assert.strictEqual(a.artistMbid, 'a74b1b7f');
+  assert.strictEqual(groupAlbums([t('/m/x/1.mp3', { album: 'X', artist: 'Y' })])[0].artistMbid, null);
+});
+
+test('sameName: how the shelf compares names', () => {
+  const { sameName } = require('../src/main/same-name');
+  assert.strictEqual(sameName('OK Computer'), sameName('ok computer!'));
+  assert.strictEqual(sameName('Three Dollar Bill, Yall$'), sameName("THREE DOLLAR BILL Y'ALL$"));
+  assert.strictEqual(sameName('!!!'), '!!!');
+});
+
+test('an older shelf cache is read again, but when each track first turned up is kept', () => {
+  const store = require('../src/main/store');
+  const music = fs.mkdtempSync(path.join(home, 'music-'));
+  store.writeMusicFolders([music]);
+  const p = `${music}/Korn/Issues/01.flac`;
+  fs.writeFileSync(path.join(home, 'shelf-cache.json'), JSON.stringify({ version: 1, folder: music, tracks: { [p]: { stamp: '10:20', info: { title: 'x' }, added: 12345 } } }));
+  delete require.cache[require.resolve('../src/main/shelf')];
+  const { readCache } = require('../src/main/shelf');
+  const cached = readCache(music);
+  assert.ok(cached, 'still found: nothing looks newly added');
+  assert.strictEqual(cached[p].added, 12345);
+  assert.strictEqual(cached[p].stamp, null, 'its tags are read again');
+  assert.strictEqual(readCache('/some/other/folder'), null);
+});
+
+test('a track\'s shelf album: its id (the same for every song of it, whoever each credits) and its tracks; forgotten after a tag edit', () => {
+  const store = require('../src/main/store');
+  const music = fs.mkdtempSync(path.join(home, 'music-'));
+  store.writeMusicFolders([music]);
+  const info = (artist) => ({ title: 't', artist, album: 'Collab Album', albumArtist: null, year: '2001', track: 1, disc: 1, duration: 60 });
+  const a = `${music}/X/Collab Album/01.flac`, b = `${music}/X/Collab Album/02.flac`;
+  const write = (tracks) => fs.writeFileSync(path.join(home, 'shelf-cache.json'), JSON.stringify({ version: 2, folder: music, tracks }));
+  write({ [a]: { stamp: 'x', info: info('X'), added: 1 }, [b]: { stamp: 'x', info: info('X feat. Y'), added: 1 } });
+  delete require.cache[require.resolve('../src/main/shelf')];
+  const shelf = require('../src/main/shelf');
+  const one = shelf.albumOf(a), two = shelf.albumOf(b);
+  assert.ok(one && one.id);
+  assert.strictEqual(one.id, two.id, 'one disc, one seed');
+  assert.deepStrictEqual(one.paths.sort(), [a, b]);
+  assert.strictEqual(shelf.albumOf('/elsewhere.mp3'), null);
+  write({ [a]: { stamp: 'x', info: { ...info('X'), album: 'Renamed' }, added: 1 } });
+  shelf.forget(a);
+  assert.deepStrictEqual(shelf.albumOf(a).paths, [a], 'read again after a tag edit');
+});
+
+test('an album comes shrink-wrapped when it turned up after wrapping began and hasn\'t been played or unwrapped', () => {
+  const { isWrapped } = require('../src/main/shelf');
+  const wrap = { since: 1000, torn: new Set(['torn']) };
+  const album = (extra) => ({ id: 'a', added: 2000, plays: 0, ...extra });
+  assert.strictEqual(isWrapped(album(), wrap), true);
+  assert.strictEqual(isWrapped(album({ added: 500 }), wrap), false, 'on the shelf before: already unwrapped');
+  assert.strictEqual(isWrapped(album({ added: null }), wrap), false);
+  assert.strictEqual(isWrapped(album({ plays: 1 }), wrap), false, 'played');
+  assert.strictEqual(isWrapped(album({ id: 'torn' }), wrap), false, 'unwrapped by hand');
+  assert.strictEqual(isWrapped(album(), { since: null, torn: new Set() }), false);
+});
+
+test('an album carries what its tracks\' tags say about its pressing: the most common of each', () => {
+  const t = (n, extra) => ({ path: `/m/Kid A/${n}.flac`, info: { title: `S${n}`, artist: 'Radiohead', album: 'Kid A', albumArtist: 'Radiohead', year: '2000', track: n, disc: 1, duration: 1, ...extra } });
+  const [a] = groupAlbums([
+    t(1, { barcode: '724352775324', catalog: 'X1', label: 'Parlophone', albumMbid: 'f9e0e4e5-1d7e-4e8d-9a46-3f1d2e6f6b1d' }),
+    t(2, { barcode: '724352775324', catalog: 'X1', label: 'EMI' }), t(3, { label: 'Parlophone' }),
+  ]);
+  assert.deepStrictEqual([a.barcode, a.catalog, a.label, a.mbReleaseId], ['724352775324', 'X1', 'Parlophone', 'f9e0e4e5-1d7e-4e8d-9a46-3f1d2e6f6b1d']);
+});
+
+test('the last track of each disc of a shelf album', () => {
+  const { isLastOfDisc } = require('../src/main/shelf');
+  const one = { paths: ['/a/1.flac', '/a/2.flac', '/a/3.flac'], discs: [1, 1, 1] };
+  assert.deepStrictEqual(one.paths.map((p) => isLastOfDisc(one, p)), [false, false, true]);
+  const two = { paths: ['/d/1-1.flac', '/d/1-2.flac', '/d/2-1.flac', '/d/2-2.flac'], discs: [1, 1, 2, 2] };
+  assert.deepStrictEqual(two.paths.map((p) => isLastOfDisc(two, p)), [false, true, false, true]);
+  const untagged = { paths: ['/u/a.mp3', '/u/b.mp3'], discs: [null, null] };
+  assert.deepStrictEqual(untagged.paths.map((p) => isLastOfDisc(untagged, p)), [false, true]);
+  assert.strictEqual(isLastOfDisc(one, '/elsewhere.flac'), false);
+});
+
+test('cachedOnly (the phone remote\'s covers): a cover found online before is given; with none, nothing is searched or remembered', async () => {
+  const find = counting({ cover: 'data:image/jpeg;base64,CCCC' });
+  const q = { artist: 'Portishead', album: 'Dummy' };
+  assert.strictEqual(await onlineCover(q, { find, cachedOnly: true }), null);
+  assert.strictEqual(find.calls.length, 0, 'not searched');
+  assert.strictEqual(await onlineCover(q, { find }), 'data:image/jpeg;base64,CCCC', 'nothing was remembered as "no cover": a real search still runs');
+  assert.strictEqual(await onlineCover(q, { find: counting(null), cachedOnly: true }), 'data:image/jpeg;base64,CCCC');
+});
+
+test('the music folders are their own list: the old music folder starts it, and a dialog opened elsewhere never changes it', () => {
+  const store = require('../src/main/store');
+  const music = fs.mkdtempSync(path.join(home, 'music-'));
+  fs.rmSync(path.join(home, 'music-folders.txt'), { force: true });
+  store.writeLastPath(music);
+  assert.deepStrictEqual(store.readMusicFolders(), [music]);
+  store.writeLastPath(path.join(home, 'Downloads')); // a song opened from Downloads
+  assert.deepStrictEqual(store.readMusicFolders(), [music]);
+  store.writeMusicFolders([music, music, path.join(home, 'unplugged')]);
+  assert.deepStrictEqual(store.readMusicFolders(), [music, path.join(home, 'unplugged')]);
+  assert.deepStrictEqual(store.musicFolders(), [music], 'one not there now stays on the list, but isn\'t read');
+});
+
+test('the shelf reads every music folder; a folder just added isn\'t all NEW, a song new in one read before is', async () => {
+  const store = require('../src/main/store');
+  const a = fs.mkdtempSync(path.join(home, 'a-')), b = fs.mkdtempSync(path.join(home, 'b-'));
+  const old = new Date(Date.UTC(2020, 0, 1));
+  const song = (dir, name) => {
+    const p = path.join(dir, name, '01.mp3');
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, '');
+    fs.utimesSync(p, old, old);
+    return p;
+  };
+  const known = song(a, 'Known'), fresh = song(a, 'Fresh'), other = song(b, 'Other');
+  fs.writeFileSync(path.join(home, 'shelf-cache.json'), JSON.stringify({ version: 2, folder: a, tracks: { [known]: { stamp: 'x', info: { title: 'k' }, added: 111 } } }));
+  store.writeMusicFolders([a, b]);
+  delete require.cache[require.resolve('../src/main/shelf')];
+  const shelf = require('../src/main/shelf');
+  const before = Date.now();
+  const r = await shelf.scanAlbums();
+  assert.deepStrictEqual([r.folder, r.folders, r.name], [a, [a, b], `${path.basename(a)} · ${path.basename(b)}`]);
+  const added = (p) => r.albums.find((x) => x.tracks.some((tr) => tr.path === p)).added;
+  assert.strictEqual(added(known), 111);
+  assert.ok(added(fresh) >= before, 'turned up in a folder read before: just added');
+  assert.strictEqual(added(other), old.getTime(), 'a folder just added: its files\' own dates');
+  assert.ok(shelf.cacheHas([a, b]) && !shelf.cacheHas([a, '/elsewhere']));
+
+  // b unplugged: the shelf read without it keeps what it read in b, for when it's back.
+  fs.renameSync(b, `${b}-away`);
+  await shelf.scanAlbums();
+  fs.renameSync(`${b}-away`, b);
+  const kept = JSON.parse(fs.readFileSync(path.join(home, 'shelf-cache.json'), 'utf8'));
+  assert.deepStrictEqual(kept.folders, [a, b]);
+  assert.ok(kept.tracks[other], 'an unplugged drive\'s tracks aren\'t read again when it comes back');
+  // A folder added round one already read: what was read in it is used.
+  assert.ok(shelf.readCache([path.dirname(a)]), 'the parent of a folder read');
+  assert.ok(!shelf.cacheHas([path.dirname(a)]), '…but the rest of the parent hasn\'t been read');
+});
+
+test('a list of music folders that can\'t be read for a moment isn\'t started over from the last dialog\'s folder', { skip: process.platform === 'win32' }, () => {
+  const store = require('../src/main/store');
+  const music = fs.mkdtempSync(path.join(home, 'music-'));
+  store.writeMusicFolders([music]);
+  assert.deepStrictEqual(store.readMusicFolders(), [music]);
+  store.writeLastPath(path.join(home, 'Downloads'));
+  const list = path.join(home, 'music-folders.txt');
+  fs.chmodSync(list, 0o000); // (another program has it open)
+  try {
+    assert.deepStrictEqual(store.readMusicFolders(), [music]);
+    assert.strictEqual(store.noMusicFolderYet(), false);
+  } finally { fs.chmodSync(list, 0o644); }
+  assert.deepStrictEqual(store.readMusicFolders(), [music]);
+});

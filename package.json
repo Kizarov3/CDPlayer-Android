@@ -1,0 +1,194 @@
+{
+  "name": "cdplayer",
+  "productName": "CDPlayer",
+  "version": "2.24.1",
+  "description": "A desktop music player that recreates the tactile feel of a physical CD player. Plays MP3, M4A, FLAC, WAV, AIFF, OGG and more with nothing else to install.",
+  "author": "Kizarov3",
+  "license": "MIT",
+  "homepage": "https://github.com/Kizarov3/CDPlayer",
+  "main": "src/main/main.js",
+  "scripts": {
+    "prestart": "node scripts/build-mac-rate.js",
+    "start": "electron .",
+    "test": "node --test test/*.test.js test/*.test.mjs",
+    "i18n": "node scripts/i18n.mjs",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux",
+    "postinstall": "node node_modules/electron/install.js",
+    "vmp-sign-dev": "python3 -m castlabs_evs.vmp sign-pkg node_modules/electron/dist",
+    "android": "node scripts/build-android.mjs"
+  },
+  "dependencies": {
+    "kuromoji": "0.1.2",
+    "music-metadata": "^11.16.1",
+    "node-taglib-sharp": "^6.0.3",
+    "onnxruntime-web": "^1.31.1",
+    "opencc-js": "1.4.2",
+    "pinyin-pro": "3.29.5"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/cli": "^8.6.2",
+    "@capacitor/core": "^8.6.2",
+    "acorn": "^8.18.0",
+    "acorn-walk": "^8.3.5",
+    "buffer": "^6.0.3",
+    "electron": "https://github.com/castlabs/electron-releases#v44.1.0+wvcus",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
+    "events": "^3.3.0",
+    "path-browserify": "^1.0.1"
+  },
+  "build": {
+    "appId": "com.kizarov3.cdplayer",
+    "productName": "CDPlayer",
+    "copyright": "Copyright © 2026 Kizarov3",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "electronDownload": {
+      "mirror": "https://github.com/castlabs/electron-releases/releases/download/"
+    },
+    "beforePack": "build/before-pack.js",
+    "afterPack": "build/vmp-sign.js",
+    "afterSign": "build/vmp-sign-after-sign.js",
+    "files": [
+      "src/**/*",
+      "package.json",
+      "!node_modules/opencc-js/dist/esm/**",
+      "!node_modules/opencc-js/dist/esm-lib/**",
+      "!node_modules/opencc-js/dist/umd/{cn2t,full}.js",
+      "!node_modules/kuromoji/test/**",
+      "!node_modules/kuromoji/demo/**",
+      "!node_modules/onnxruntime-web/lib/**",
+      "!node_modules/onnxruntime-web/types/**",
+      "!node_modules/onnxruntime-web/**/*.map",
+      "!node_modules/onnxruntime-web/**/*.d.ts",
+      "!node_modules/onnxruntime-web/dist/ort.{all,webgl,webgpu,wasm,bundle,training}*",
+      "!node_modules/onnxruntime-web/dist/ort.m*",
+      "!node_modules/onnxruntime-web/dist/ort.b*",
+      "!node_modules/onnxruntime-web/dist/ort.js",
+      "!node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.{asyncify,jsep,jspi}*"
+    ],
+    "fileAssociations": [
+      {
+        "ext": [
+          "mp3",
+          "m4a",
+          "aac",
+          "flac",
+          "wav",
+          "aif",
+          "aiff",
+          "au",
+          "ogg",
+          "oga",
+          "opus"
+        ],
+        "name": "Audio",
+        "role": "Viewer"
+      },
+      {
+        "ext": [
+          "cue"
+        ],
+        "name": "CUE Sheet",
+        "role": "Viewer"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.music",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "identity": "-",
+      "hardenedRuntime": false,
+      "extraResources": [
+        {
+          "from": "build/bin/mac-rate",
+          "to": "mac-rate"
+        }
+      ],
+      "x64ArchFiles": "Contents/Resources/mac-rate"
+    },
+    "dmg": {
+      "title": "CDPlayer ${version}",
+      "artifactName": "${productName}-${version}-mac.${ext}"
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-windows.${ext}"
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "category": "AudioVideo;Audio;Player",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "maintainer": "Kizarov3",
+      "syncDesktopName": true,
+      "extraFiles": [
+        {
+          "from": "build/linux/generated/com.kizarov3.cdplayer.metainfo.xml",
+          "to": "usr/share/metainfo/com.kizarov3.cdplayer.metainfo.xml"
+        }
+      ]
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "Kizarov3",
+      "repo": "CDPlayer"
+    },
+    "asarUnpack": [
+      "src/main/decoders/**",
+      "src/main/win-cd/**",
+      "src/main/win-rate/**",
+      "src/main/encoders/**",
+      "src/main/karaoke/**",
+      "node_modules/kuromoji/**",
+      "node_modules/async/**",
+      "node_modules/doublearray/**",
+      "node_modules/zlibjs/**",
+      "node_modules/pinyin-pro/**",
+      "node_modules/opencc-js/**",
+      "node_modules/onnxruntime-web/**",
+      "node_modules/onnxruntime-common/**"
+    ],
+    "electronLanguages": [
+      "en",
+      "en-US",
+      "en_GB"
+    ],
+    "appImage": {
+      "artifactName": "${productName}-${version}-linux.${ext}"
+    }
+  },
+  "desktopName": "cdplayer.desktop",
+  "overrides": {
+    "uuid": "^11.1.1"
+  }
+}

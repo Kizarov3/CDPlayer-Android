@@ -1,0 +1,132 @@
+import test from 'node:test';
+import assert from 'node:assert';
+import { albumCredits, albumSummary, albumSmallPrint, sameAlbum, ownerMarks } from '../src/renderer/js/booklet-content.js';
+
+const song = (credits, extra = {}) => ({ title: 'x', artist: 'Limp Bizkit', duration: 200, quality: 'AAC · 256 KBPS', credits, ...extra });
+
+test('an album\'s credits: what most of its songs say, one row each, empty ones left out', () => {
+  const rows = albumCredits([
+    song({ released: '1997-07-01', genre: 'Nu Metal', label: 'Flip', producer: 'Ross Robinson' }),
+    song({ released: '1997-07-01', genre: 'Rock', label: 'Flip' }),
+    song({ released: '1997', genre: 'Nu Metal', catalog: 'INTD-90124' }),
+  ]);
+  assert.deepStrictEqual(rows, [
+    ['PRODUCED BY', 'Ross Robinson'], ['RELEASED', '1 July 1997'], ['GENRE', 'Nu Metal'], ['LABEL', 'Flip'], ['CATALOG NO.', 'INTD-90124'],
+  ]);
+  assert.deepStrictEqual(albumCredits([song({}), song(undefined)]), []);
+});
+
+test('this album: tracks, length, format (or "Mixed"), and every play of its songs', () => {
+  const details = [song({}, { duration: 48 }), song({}, { duration: 232 }), null];
+  assert.deepStrictEqual(albumSummary({ details, plays: [3, 0, 2], discs: 1 }), [
+    ['TRACKS', '3'], ['LENGTH', '4:40'], ['FORMAT', 'AAC · 256 KBPS'], ['PLAYED', '5 times'],
+  ]);
+  const mixed = [song({}, { quality: 'FLAC · 16-BIT · 44.1 KHZ' }), song({}, { quality: 'MP3 · 320 KBPS' })];
+  assert.deepStrictEqual(albumSummary({ details: mixed, plays: [1, 0], discs: 2 }), [
+    ['TRACKS', '2'], ['DISCS', '2'], ['LENGTH', '6:40'], ['FORMAT', 'Mixed'], ['PLAYED', '1 time'],
+  ]);
+  assert.deepStrictEqual(albumSummary({ details: [song({}, { duration: 3725 })], plays: [0], discs: 1 })[1], ['LENGTH', '62:05']);
+});
+
+test('the back cover\'s small print comes from whichever song has it', () => {
+  assert.deepStrictEqual(albumSmallPrint([song({}), song({ copyright: '1997 Flip/Interscope', barcode: '606949012421', label: 'Flip', catalog: 'INTD-90124' })]),
+    { copyright: '1997 Flip/Interscope', barcode: '606949012421', label: 'Flip', catalog: 'INTD-90124' });
+  assert.deepStrictEqual(albumSmallPrint([song({}), null]), { copyright: null, barcode: null, label: null, catalog: null });
+});
+
+test('one codec at varying bitrates is that codec at their average, not "Mixed"', () => {
+  const at = (quality) => song({}, { quality });
+  const format = (qs) => albumSummary({ details: qs.map(at), plays: [], discs: 1 }).find(([k]) => k === 'FORMAT')[1];
+  assert.strictEqual(format(['AAC · 277 KBPS', 'AAC · 273 KBPS', 'AAC · 262 KBPS']), 'AAC · 271 KBPS');
+  assert.strictEqual(format(['FLAC · 24-BIT · 96 KHZ', 'FLAC · 16-BIT · 44.1 KHZ']), 'FLAC');
+  assert.strictEqual(format(['FLAC · 16-BIT · 44.1 KHZ', 'FLAC · 16-BIT · 44.1 KHZ']), 'FLAC · 16-BIT · 44.1 KHZ');
+  assert.strictEqual(format(['AAC · 256 KBPS', 'MP3 · 320 KBPS']), 'Mixed');
+});
+
+test('the same album whatever its punctuation or capitals, as on the shelf', () => {
+  assert.ok(sameAlbum("Three Dollar Bill, Yall$", "Three Dollar Bill Y'All$"));
+  assert.ok(sameAlbum('OK Computer', 'ok computer'));
+  assert.ok(!sameAlbum('OK Computer', 'OK Computer OKNOTOK 1997 2017'));
+  assert.ok(!sameAlbum('Kid A', null));
+});
+
+const DAY = 86400000, NOW = new Date(2026, 8, 29, 18, 0).getTime();
+
+test('tally marks in the margin: bundles of five, then just ×N past twenty', () => {
+  const m = (n) => ownerMarks({ plays: [n], first: [null], last: [null], now: NOW }).tallies[0];
+  assert.strictEqual(m(0), null);
+  assert.deepStrictEqual(m(1), { fives: 0, ones: 1 });
+  assert.deepStrictEqual(m(5), { fives: 1, ones: 0 });
+  assert.deepStrictEqual(m(20), { fives: 4, ones: 0 });
+  assert.deepStrictEqual(m(47), { times: '×47' });
+});
+
+test('the favourite: the most played song, three plays or more, the first of a tie', () => {
+  const fav = (plays) => ownerMarks({ plays, first: plays.map(() => null), last: plays.map(() => null), now: NOW }).favorite;
+  assert.strictEqual(fav([1, 2, 2]), -1);
+  assert.strictEqual(fav([3, 9, 4]), 1);
+  assert.strictEqual(fav([5, 2, 5]), 0);
+  assert.strictEqual(fav([]), -1);
+});
+
+test('the first spin and the last, in words', () => {
+  const notes = (first, last) => ownerMarks({ plays: first.map(() => 1), first, last, now: NOW }).notes;
+  const march = new Date(2024, 2, 12, 20, 0).getTime();
+  assert.deepStrictEqual(notes([march, march + 5 * DAY], [NOW - 2 * 3600000, NOW - 3 * DAY]), ['1st spin: 12 Mar 2024', 'last: today']);
+  assert.deepStrictEqual(notes([null], [NOW - 30 * 3600000]), ['last: yesterday']);
+  assert.deepStrictEqual(notes([null], [NOW - 3 * DAY]), ['last: 3 days ago']);
+  assert.deepStrictEqual(notes([null], [NOW - 70 * DAY]), ['last: 2 months ago']);
+  assert.deepStrictEqual(notes([null], [NOW - 800 * DAY]), ['last: 2 years ago']);
+  assert.deepStrictEqual(notes([null], [null]), []);
+});
+
+test('album credits fill in from Discogs what the tags lack, and add country and pressing', () => {
+  const details = [song({ label: 'Parlophone' })];
+  assert.deepStrictEqual(albumCredits(details, { label: 'EMI', catno: 'X1', barcode: '724', country: 'UK', formats: 'CD, Album' }),
+    [['LABEL', 'Parlophone'], ['CATALOG NO.', 'X1'], ['BARCODE', '724'], ['COUNTRY', 'UK'], ['PRESSING', 'CD, Album']]);
+  assert.deepStrictEqual(albumCredits(details), [['LABEL', 'Parlophone']]);
+  assert.deepStrictEqual(albumCredits([song({ barcode: '999' })]), [['BARCODE', '999']]);
+});
+
+test('the album\'s story: a long paragraph in pieces at its sentences, so a page never cuts one off', async () => {
+  const { storyChunks } = await import('../src/renderer/js/booklet-content.js');
+  const long = Array.from({ length: 12 }, (_, i) => `Sentence number ${i + 1} is here and it says a little.`).join(' ');
+  const chunks = storyChunks(['Short one.', long], 200);
+  assert.deepStrictEqual(chunks[0], { text: 'Short one.', end: true });
+  const rest = chunks.slice(1);
+  assert.ok(rest.length > 1 && rest.every((c) => c.text.length <= 200));
+  assert.strictEqual(rest.map((c) => c.text).join(' '), long);
+  assert.deepStrictEqual(rest.map((c) => c.end), [...rest.slice(1).map(() => false), true]);
+  assert.deepStrictEqual(storyChunks(['x'.repeat(300)], 200), [{ text: 'x'.repeat(300), end: true }], 'one long sentence stays whole');
+});
+
+test('when the album came out, and how long ago', async () => {
+  const { releasedLine } = await import('../src/renderer/js/booklet-content.js');
+  const now = new Date('2026-10-14T12:00:00Z');
+  assert.strictEqual(releasedLine('1996-09-17', { locale: 'en', now }), 'Released 17 September 1996 · 30 years ago');
+  assert.strictEqual(releasedLine('1996', { locale: 'en', now }), 'Released 1996 · 30 years ago');
+  assert.strictEqual(releasedLine('2025-11-01', { locale: 'en', now }), 'Released 1 November 2025');
+  assert.strictEqual(releasedLine('2025-10-01', { locale: 'en', now }), 'Released 1 October 2025 · 1 year ago');
+  assert.strictEqual(releasedLine(null, { locale: 'en', now }), null);
+});
+
+test('a found hidden song is written in under its track, and isn\'t listed as missing', async () => {
+  const { penHidden } = await import('../src/renderer/js/booklet-content.js');
+  const rows = [
+    { name: 'Polly', track: 0 },
+    { name: 'Something in the Way', track: 1 },
+    { name: 'Endless, Nameless', missing: true, track: -1 }, // MusicBrainz's own track for it
+  ];
+  assert.deepStrictEqual(penHidden(rows, [null, 'Endless, Nameless']), [
+    { name: 'Polly', track: 0 },
+    { name: 'Something in the Way', track: 1 },
+    { pen: true, name: 'Endless, Nameless' },
+  ]);
+  assert.deepStrictEqual(penHidden(rows, [null, null]), rows);
+});
+
+test('the back cover says how many times the album was played through, a single aside', () => {
+  const m = ownerMarks({ plays: [1, 1], first: [null, null], last: [null, null], through: 3 });
+  assert.ok(m.notes.includes('start to end ×3'));
+  assert.ok(!ownerMarks({ plays: [4], first: [null], last: [null], through: 4 }).notes.some((n) => n.includes('×')));
+});

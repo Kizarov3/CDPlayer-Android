@@ -1,0 +1,1880 @@
+'use strict';
+const { Worker } = require('worker_threads');
+const { app, BrowserWindow, ipcMain, dialog, protocol, screen, shell, Menu, nativeTheme, components, clipboard, ClipboardItem, nativeImage, powerSaveBlocker } = require('electron');
+const path = require('path');
+const fs = require('fs');
+
+// `--smoke-test=<folder>`: used by CI on macOS, Windows and Linux to prove the *packaged* app can decode every
+// audio file in <folder> and read its tags, then exit 0/1. Runs against a throwaway data folder — set before
+// ./store is loaded, so a real user's ~/.cdplayer is never read or written.
+const smokeArg = process.argv.find((a) => a.startsWith('--smoke-test='));
+const smokeDir = smokeArg ? path.resolve(smokeArg.slice('--smoke-test='.length)) : null;
+if (smokeDir) {
+  process.env.CDPLAYER_HOME = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdplayer-smoke-'));
+  process.on('exit', () => { try { fs.rmSync(process.env.CDPLAYER_HOME, { recursive: true, force: true }); } catch { /* left for the system to clear */ } });
+}
+// `--theme-shots=<outdir> [--themes=RED,WHITE] [--audio=<folder>]`: screenshots of every look and screen in each theme
+// (theme-shots.js), in a throwaway data folder too, with a hidden window that never takes focus.
+const shotsArg = process.argv.find((a) => a.startsWith('--theme-shots='));
+const shotsDir = shotsArg ? path.resolve(shotsArg.slice('--theme-shots='.length)) : null;
+const shotThemes = (() => { const a = process.argv.find((x) => x.startsWith('--themes=')); return (a ? a.slice(9) : 'RED').split(',').map((x) => x.trim()).filter(Boolean); })();
+const shotArg = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.slice(name.length + 3) : null; };
+// `--theme-compare=<before>,<after>`: two --theme-shots folders, screen by screen; exits 1 if any differs (theme-shots.js).
+const compareArg = process.argv.find((a) => a.startsWith('--theme-compare='));
+// `--perf-report=<file.json> [--perf-seconds=<s>]`: what the player costs and how quickly it answers, scenario by
+// scenario, in the real window (perf-report.js), in a throwaway data folder too.
+const perfArg = process.argv.find((a) => a.startsWith('--perf-report='));
+const perfOut = perfArg ? path.resolve(perfArg.slice('--perf-report='.length)) : null;
+// (`--perf-software`: without the graphics card, as in a virtual machine — where what the window draws costs the most)
+if (perfOut && process.argv.includes('--perf-software')) app.disableHardwareAcceleration();
+if (shotsDir || compareArg || perfOut) {
+  process.env.CDPLAYER_HOME = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cdplayer-shots-'));
+  process.on('exit', () => { try { fs.rmSync(process.env.CDPLAYER_HOME, { recursive: true, force: true }); } catch { /* left for the system to clear */ } });
+}
+// An isolated data folder (tests) also gets its own Electron profile, so it's a separate single instance and never
+// hands off to — or shares browser storage with — a CDPlayer the user already has open.
+if (process.env.CDPLAYER_HOME) app.setPath('userData', path.join(process.env.CDPLAYER_HOME, 'electron-profile'));
+// (tests, with an isolated data folder only: the files picked in place of the system's Open dialog — one path a line in
+// the file CDPLAYER_TEST_PICK names, read each time; an empty file is CANCEL)
+if (process.env.CDPLAYER_HOME && process.env.CDPLAYER_TEST_PICK) {
+  dialog.showOpenDialog = async () => {
+    const filePaths = fs.readFileSync(process.env.CDPLAYER_TEST_PICK, 'utf8').split(/\r?\n/).filter(Boolean);
+    return { canceled: !filePaths.length, filePaths };
+  };
+}
+
+const store = require('./store');
+const userThemes = require('./user-themes');
+const i18n = require('./i18n');
+const { t } = i18n; // the main process's own text — dialogs and menus — in the interface's language
+const metadata = require('./metadata');
+const online = require('./online');
+const spotify = require('./spotify');
+const library = require('./library');
+const media = require('./media-protocol');
+const streaming = require('./streaming');
+const updates = require('./updates');
+const discord = require('./discord');
+const cue = require('./cue');
+const shelf = require('./shelf');
+const { recordPlay } = require('./plays');
+const relocate = require('./relocate');
+const albumRuns = require('./album-runs');
+const pet = require('./pet');
+const listens = require('./listens');
+const { yearOnShelf } = require('./year-shelf');
+const tagWriter = require('./tag-writer');
+const audioCd = require('./audio-cd');
+const rip = require('./rip');
+const { execFile } = require('child_process');
+const { createOutputRate } = require('./output-rate');
+const { initialTheme } = require('./first-theme');
+const startupTheme = require('./startup-theme');
+
+const APP_VERSION = app.getVersion();
+const APP_ID = 'com.kizarov3.cdplayer'; // = build.appId in package.json
+const MAIN_MIN = { width: 760, height: 785 };
+const MAIN_DEFAULT = { width: 1120, height: 820 };
+const MINI = { width: 340, height: 164 };
+
+// The window's title bar and native menus follow the chosen theme, not the system. Until the theme is known an existing
+// install is dark (as before); a new one stays on 'system' so the first-launch read of the system appearance is honest.
+// (Set from the theme in whenReady, then by the renderer through ui:setNativeLight.)
+const hadSettings = store.isFile(store.file(store.FILES.settings));
+nativeTheme.themeSource = hadSettings ? 'dark' : 'system';
+// Windows names whoever is playing in its media controls by the app's ID (AppUserModelID), which it looks up in the
+// Start menu — so set a stable one here, and keep a Start menu shortcut carrying it (see registerWindowsShortcut).
+if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
+
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'cdp', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true } },
+]);
+
+// Launched with audio files (double-click / "Open with" / drag onto the dock icon): queue them. Also keeps a
+// single window — a second launch hands its files to the running instance instead of opening another player.
+const pendingOpenFiles = [];
+function audioArgs(argv) {
+  return argv.slice(1).filter((a) => !a.startsWith('-') && (library.isSupportedAudio(a) || cue.isCueFile(a)) && store.isFile(a));
+}
+const gotLock = !!smokeDir || !!shotsDir || !!compareArg || !!perfOut || app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (_e, argv) => {
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.focus();
+    const files = audioArgs(argv);
+    if (files.length) win.webContents.send('open-files', files);
+  });
+  pendingOpenFiles.push(...audioArgs(process.argv));
+}
+app.on('open-file', (event, filePath) => {
+  event.preventDefault();
+  if (win && win.webContents && !win.webContents.isLoading()) win.webContents.send('open-files', [filePath]);
+  else pendingOpenFiles.push(filePath);
+});
+
+let win = null;
+if (shotsDir) store.writeSettings({ ...store.DEFAULT_SETTINGS, eq: store.DEFAULT_SETTINGS.eq.slice(), animations: false, volume: 0, language: 'en', theme: shotThemes[0] || 'RED' });
+if (perfOut) { store.writeSettings({ ...store.DEFAULT_SETTINGS, eq: store.DEFAULT_SETTINGS.eq.slice(), volume: 0, language: 'en', theme: shotThemes[0] || 'RED' }); store.markOnboarded(); store.writeLastVersion(APP_VERSION); } // (no first-run tour or WHAT'S NEW in its way)
+let settings = store.readSettings();
+let normalBounds = null;
+let miniMode = false;
+let miniWin = null;
+let quitting = false;
+
+function boundsOnScreen(b) {
+  if (!b || b.width < MAIN_MIN.width || b.height < MAIN_MIN.height) return false;
+  return screen.getAllDisplays().some(({ bounds: d }) => b.x < d.x + d.width && b.x + b.width > d.x && b.y < d.y + d.height && b.y + b.height > d.y);
+}
+
+function captureNormalBounds() {
+  if (!win || miniMode || win.isFullScreen() || win.isMaximized() || win.isMinimized()) return;
+  normalBounds = win.getBounds();
+}
+
+function persistSettings() {
+  store.writeSettings({ ...settings, bounds: normalBounds || settings.bounds, miniMode });
+}
+
+function createWindow() {
+  const saved = boundsOnScreen(settings.bounds) ? settings.bounds : null;
+  // A light theme saved (WHITE, or one of your own with a light background): the window's own background and the page's
+  // first frame in its colours too (js/first-paint.js), so it doesn't flash dark before the renderer has the theme.
+  const light = startupTheme.lightPalette(settings.theme, userThemes.list());
+  win = new BrowserWindow({
+    ...(saved || MAIN_DEFAULT),
+    minWidth: MAIN_MIN.width,
+    minHeight: MAIN_MIN.height,
+    title: 'CDPlayer',
+    backgroundColor: light ? startupTheme.hex(light.bg) : '#111113',
+    show: false,
+    autoHideMenuBar: true,
+    icon: process.platform === 'linux' ? path.join(__dirname, '..', 'renderer', 'icon.png') : undefined,
+    webPreferences: {
+      preload: path.join(__dirname, '..', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      // Playback must keep advancing (track ends, crossfades, the sleep timer) while the window is hidden/minimized.
+      backgroundThrottling: false,
+      autoplayPolicy: 'no-user-gesture-required',
+      spellcheck: false,
+      ...(light ? { additionalArguments: [`--cdp-light=${startupTheme.paletteArg(light)}`] } : {}),
+    },
+  });
+  if (saved) normalBounds = saved;
+  win.on('resize', captureNormalBounds);
+  win.on('move', captureNormalBounds);
+  // (whether there's anything of it to see: with background throttling off, a hidden window never hears it's hidden;
+  // focus too, so a 'restore' that never comes can't leave the window drawing four times a second)
+  // A window with focus is shown, whatever isVisible() says: on opening, 'focus' can come while the window isn't visible
+  // yet, and its "hidden" came after 'show' — the window then drew nothing (time, karaoke, CD View stood still) until
+  // it was left and come back to. The rest are looked at once the event's over, not halfway through it (and not by
+  // isFocused(): just hidden, a window still says it has focus).
+  for (const event of ['hide', 'minimize', 'show', 'restore', 'focus']) {
+    win.on(event, () => {
+      if (event === 'focus') { win.webContents.send('window-shown', true); return; }
+      setTimeout(() => { if (!win.isDestroyed()) win.webContents.send('window-shown', !win.isMinimized() && win.isVisible()); }, 0);
+    });
+  }
+  win.on('enter-full-screen', () => win.webContents.send('fullscreen-changed', true));
+  win.on('leave-full-screen', () => win.webContents.send('fullscreen-changed', false));
+  win.on('close', () => {
+    if (!win.webContents.isCrashed()) try { win.webContents.send('app-closing'); } catch { /* already gone */ } // (a page that's gone can't be told)
+    persistSettings();
+  });
+  win.on('closed', () => { win = null; if (miniWin && !miniWin.isDestroyed()) { quitting = true; miniWin.close(); } });
+  win.once('ready-to-show', () => { if (!smokeDir && !shotsDir && !perfOut) win.show(); });
+  win.webContents.on('will-navigate', (e) => e.preventDefault());
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  // The page's process gone (a crash, or the system ending it): load the player again rather than leave an empty
+  // window — at most three times a minute, so a page that dies as it starts can't go round and round.
+  let revived = [];
+  win.webContents.on('render-process-gone', (_e, details) => {
+    console.error(`The player's page went (${details.reason}, exit code ${details.exitCode})`);
+    phonePageGone();
+    if (details.reason === 'clean-exit' || quitting || win.isDestroyed()) return;
+    const now = Date.now();
+    revived = revived.filter((t) => now - t < 60000);
+    if (revived.length >= 3) return;
+    revived.push(now);
+    win.webContents.reload();
+  });
+  win.webContents.on('did-finish-load', () => {
+    if (smokeDir) { runSmokeTest(); return; }
+    if (shotsDir) { if (win.webContents.getURL().startsWith('cdp://')) runThemeShots(); return; } // (not the blank page the pinning loads first)
+    if (perfOut) { if (win.webContents.getURL().startsWith('cdp://')) runPerfReport(); return; }
+    if (pendingOpenFiles.length) { win.webContents.send('open-files', pendingOpenFiles.splice(0)); }
+    phonePageBack();
+  });
+  // (the screenshots' run pins the page's clock first — theme-shots.js)
+  if (shotsDir) require('./theme-shots').pinTime(win).then(() => win.loadURL('cdp://app/index.html'));
+  else if (perfOut) require('./perf-report').probe(win).then(() => win.loadURL('cdp://app/index.html'));
+  else win.loadURL('cdp://app/index.html');
+}
+
+async function runThemeShots() {
+  const shots = require('./theme-shots');
+  let code = 0;
+  try {
+    const themes = shotThemes;
+    const made = shotArg('audio') ? null : await shots.makeAlbum(nativeImage, path.join(__dirname, '..', '..', 'test', 'fixtures', 'smoke.mp3'));
+    const audio = shotArg('audio') ? path.resolve(shotArg('audio')) : made.album;
+    store.writeMusicFolders([audio]);
+    fs.mkdirSync(shotsDir, { recursive: true });
+    // The phone remote, on the loopback for the run: the pairing address of a server the player's page feeds as usual.
+    const phoneRemote = async () => {
+      remoteConf = { ...remoteConf, on: true, token: 'theme-shots-token' }; // (fixed: where it's shown, it's the same every run)
+      const server = newRemoteServer('127.0.0.1', 47831);
+      const { port } = await server.start();
+      remote = server; remoteAt = { address: '127.0.0.1', port };
+      toPage('remote-listening', true);
+      return `http://127.0.0.1:${port}/pair?k=${remoteConf.token}`;
+    };
+    const r = await shots.run({ win, miniWindow: () => miniWin, outDir: shotsDir, themes, audio, nativeImage, store, phoneRemote });
+    console.log(`theme-shots: ${r.written.length} pictures in ${shotsDir}`);
+    if (made) fs.rmSync(made.root, { recursive: true, force: true });
+  } catch (e) { console.error('theme-shots failed:', e); code = 1; }
+  quitting = true;
+  app.exit(code);
+}
+
+async function runPerfReport() {
+  let code = 0;
+  try {
+    const seconds = Number(shotArg('perf-seconds')) || 5;
+    const r = await require('./perf-report').run({ win, app, seconds, bisect: shotArg('perf-bisect'), profile: process.argv.includes('--perf-profile') });
+    fs.writeFileSync(perfOut, JSON.stringify({ platform: process.platform, arch: process.arch, electron: process.versions.electron, at: new Date().toISOString(), ...r }, null, 2) + '\n');
+    console.log(`perf: written to ${perfOut}`);
+  } catch (e) { console.error('perf-report failed:', e); code = 1; }
+  quitting = true;
+  app.exit(code);
+}
+
+function runThemeCompare() {
+  let code = 0;
+  try {
+    const [before, after] = compareArg.slice('--theme-compare='.length).split(',').map((d) => path.resolve(d));
+    const r = require('./theme-shots').compare(before, after, nativeImage);
+    for (const line of r.lines) console.log(line);
+    console.log(r.bad.length ? `theme-compare: ${r.bad.length} of ${r.lines.length} differ: ${r.bad.join(', ')}` : `theme-compare: all ${r.lines.length} the same`);
+    code = r.bad.length || !r.lines.length ? 1 : 0;
+  } catch (e) { console.error('theme-compare failed:', e); code = 1; }
+  quitting = true;
+  app.exit(code);
+}
+
+async function runSmokeTest() {
+  const files = library.collectAudio([smokeDir]);
+  const paths = (await files).sort(library.byName);
+  const results = [];
+  for (const p of paths) {
+    const details = await metadata.getDetails(p, { withCover: true });
+    // Decode through the exact same cdp:// media path the player uses (so AIFF/AU/ALAC go through the fallback
+    // decoders), and also make sure an <audio> element accepts the stream.
+    const probe = await win.webContents.executeJavaScript(`(async () => {
+      const url = window.cdp.mediaUrl(${JSON.stringify(p)});
+      const buf = await (await fetch(url)).arrayBuffer();
+      const audio = await new OfflineAudioContext(2, 1, 44100).decodeAudioData(buf);
+      const el = new Audio(url);
+      const elementDuration = await new Promise((ok, fail) => { el.onloadedmetadata = () => ok(el.duration); el.onerror = () => fail(new Error('media element error')); });
+      return { decoded: audio.duration, element: elementDuration };
+    })()`).catch((e) => ({ error: String(e.message || e) }));
+    const ok = !probe.error && probe.decoded > 0.3 && probe.element > 0.3 && !!details.title;
+    results.push({ file: path.basename(p), ok, title: details.title, ...probe });
+  }
+  // The output-rate helper must start and answer in the packaged app (a CI machine may have no outputs: [] is fine).
+  const rateList = process.platform === 'linux' ? [] : await outputRate.list();
+  const rateOk = Array.isArray(rateList);
+  // Karaoke's models must be in the build and really run in it: ten seconds of a tone through the whole of the word timing.
+  const tone = () => Float32Array.from({ length: 441000 }, (_, i) => 0.2 * Math.sin(i * 0.06));
+  const wordTiming = !wordFit.available() ? 'models missing' : await wordFit.run(path.join(smokeDir, 'smoke-tone'), 'smoke', { left: tone(), right: tone(), move: 0, lines: [{ time: 1, next: 9, words: ['hello', 'world'] }] })
+    .then(() => 'ok', (e) => String(e.message || e));
+  // (and the words in Latin letters, Japanese's dictionary and Chinese's included)
+  const inLatin = await romanize.lines(['君の名前', '世界は美しい', '안녕하세요', 'Привет']).then((l) => (l.every(Boolean) ? 'ok' : JSON.stringify(l)), (e) => String(e.message || e));
+  const inChinese = await romanize.lines(['我爱你']).then((l) => (l[0] === 'wǒ ài nǐ' ? 'ok' : JSON.stringify(l)), (e) => String(e.message || e));
+  const allOk = results.length > 0 && results.every((r) => r.ok) && rateOk && wordTiming === 'ok' && inLatin === 'ok' && inChinese === 'ok';
+  process.stdout.write(`${JSON.stringify({ platform: process.platform, arch: process.arch, allOk, outputRate: rateList, wordTiming, inLatin, inChinese, results }, null, 2)}\n`);
+  app.exit(allOk ? 0 : 1);
+}
+
+function buildMenu() {
+  if (process.platform !== 'darwin') { Menu.setApplicationMenu(null); return; }
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { role: 'appMenu' },
+    { role: 'editMenu' },
+    { label: t('Window'), submenu: [{ role: 'minimize' }, { role: 'zoom' }, { type: 'separator' }, { role: 'front' }] },
+  ]));
+}
+
+// ---- IPC ------------------------------------------------------------------------------------------------------
+
+const handle = (channel, fn) => ipcMain.handle(channel, (_e, ...args) => fn(...args));
+
+// Settings → QUALITY: the output device's rate, switched by a helper per system (src/main/output-rate.js).
+function outputRateHelper() {
+  if (process.platform === 'darwin') {
+    const bin = app.isPackaged ? path.join(process.resourcesPath, 'mac-rate') : path.join(__dirname, '..', '..', 'build', 'bin', 'mac-rate');
+    return (args) => runJson(bin, args);
+  }
+  const script = path.join(__dirname, 'win-rate', 'helper.ps1').replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
+  return (args) => runJson('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, ...args]);
+}
+function runJson(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout: 5000, windowsHide: true }, (err, stdout) => {
+      if (err) { reject(err); return; }
+      try { resolve(JSON.parse(String(stdout).trim())); } catch (e) { reject(e); }
+    });
+  });
+}
+const outputRate = createOutputRate({ platform: process.platform, run: outputRateHelper(), file: path.join(store.dataDir(), 'output-rate.json') });
+if (!smokeDir && gotLock) outputRate.restore().catch(() => {}); // left over from a run that didn't get to quit (a second launch must not undo the first one's)
+handle('outputRate:list', () => outputRate.list());
+handle('outputRate:current', (device) => outputRate.current(device));
+handle('outputRate:set', (device, hz) => outputRate.set(device, hz));
+handle('outputRate:restore', () => outputRate.restore());
+// Widevine arrives through castLabs' component updater (downloaded on first run), so it's awaited only when Spotify
+// needs it — never at startup, which must work offline and in the smoke test.
+function drmReady() {
+  if (!components || typeof components.whenReady !== 'function') return Promise.resolve(false);
+  return Promise.race([
+    components.whenReady().then(() => true, () => false),
+    new Promise((resolve) => setTimeout(() => resolve(false), 20000)),
+  ]);
+}
+
+handle('state:load', () => ({
+  settings,
+  queue: store.readQueue(),
+  changerQueue: store.readChangerQueue(),
+  history: relocate.newestFirst(store.readHistory(), playedAt()), // a song back from an unplugged drive in its place
+  eqPresets: store.readEqPresets(),
+  lastPath: store.readLastPath(),
+  onboarded: store.isOnboarded(),
+  lastVersion: store.readLastVersion(),
+  themes: userThemes.list(),
+  version: APP_VERSION,
+  platform: process.platform,
+}));
+handle('ui:setNativeLight', (light) => { const source = light === true ? 'light' : 'dark'; if (nativeTheme.themeSource !== source) nativeTheme.themeSource = source; }); // (only when it changes: the theme editor shows a theme at every colour picked)
+handle('state:saveSettings', (s) => { settings = { ...settings, ...s }; persistSettings(); });
+handle('state:saveQueue', (q) => store.writeQueue(q));
+handle('state:saveHistory', (paths) => store.writeHistory(paths));
+handle('state:saveEqPresets', (presets) => store.writeEqPresets(presets));
+handle('state:markOnboarded', () => store.markOnboarded());
+handle('state:writeLastVersion', (v) => store.writeLastVersion(v));
+// Synchronous on purpose: called from the renderer's beforeunload, where async IPC may never be delivered.
+ipcMain.on('state:saveQueueSync', (e, q) => { e.returnValue = store.writeQueue(q); });
+// The interface's language (i18n.js): the dictionary, read once by each window as it loads; the languages to pick from;
+// and the restart a new pick needs (the window saves the queue on its way out, as on any quit).
+ipcMain.on('i18n:dict', (e) => { e.returnValue = i18n.current(); });
+handle('i18n:list', () => ({ locales: i18n.listLocales(), auto: i18n.resolveLocale('AUTO', app.getPreferredSystemLanguages(), i18n.listLocales().map((l) => l.code)) }));
+handle('app:relaunch', () => { app.relaunch(); app.quit(); });
+
+handle('fs:exists', (p) => cue.entryExists(p));
+handle('meta:details', (p, opts) => metadata.getDetails(p, opts));
+// Streamed songs (streaming.js): YouTube Music's albums and SoundCloud's songs found, an album opened, the next song readied.
+streaming.setStore(store);
+handle('stream:search', (query, where) => streaming.search(String(query || ''), where));
+handle('stream:album', (page) => streaming.album(page));
+handle('stream:prepare', (page) => streaming.prepare(page));
+handle('stream:locked', (page) => streaming.isLocked(page));
+handle('stream:available', () => streaming.available());
+handle('stream:install', () => streaming.install());
+// Play counts, kept in memory and written a moment after the last change.
+let playCounts = null, playsTimer = null;
+const plays = () => (playCounts = playCounts || store.readPlayCounts());
+let lastPlayed = null, firstPlayed = null;
+const playedAt = () => (lastPlayed = lastPlayed || store.readLastPlayed());
+const firstPlayedAt = () => (firstPlayed = firstPlayed || store.readFirstPlayed());
+// Albums heard from start to end, and where one was left (album-runs.js).
+let runs = null, runsChanged = false;
+const runsState = () => (runs = runs || albumRuns.parse(store.readText('album-runs.json')));
+function writePlays() {
+  playsTimer = null;
+  if (petChanged) { petChanged = false; store.writeText('pet.json', pet.format(petState)); }
+  if (runsChanged) { runsChanged = false; store.writeText('album-runs.json', JSON.stringify(runs)); }
+  store.writePlayCounts(playCounts);
+  if (lastPlayed) store.writeLastPlayed(lastPlayed);
+  if (firstPlayed) store.writeFirstPlayed(firstPlayed);
+}
+// Every play with when (listens.js), for THE YEAR ON THE SHELF and ON THIS DAY: begun, the first time, from each song's
+// first and last play; a play is a line added to its end, the whole written anew only when it's grown past its limit.
+let listenLog = null;
+function listened() {
+  if (listenLog) return listenLog;
+  const text = store.readText('listens.txt');
+  listenLog = text != null ? listens.parse(text) : listens.seed(firstPlayedAt(), playedAt());
+  if (text == null) store.writeText('listens.txt', listens.format(listenLog));
+  return listenLog;
+}
+function logPlays(entries) { // (imported: in their places in time, so written anew)
+  listens.merge(listened(), entries);
+  store.writeText('listens.txt', listens.format(listenLog));
+}
+// BLIP, the pet in the deck's display (pet.js): kept in pet.json, moved on by each play while DECK PET is on. What it
+// knows is read again from the history (at most every 30 s, and at each play), so it never drifts from it.
+let petState = null, petOn = false, petChanged = false, petStats = null, petStatsAt = 0, petLastMeal = null;
+const petMemo = {}; // (pet.stats: what's been added up of the history, so a play reads only itself and the last 30 days)
+function petNow() {
+  if (petState) return petState;
+  const text = store.readText('pet.json');
+  petState = pet.parse(text);
+  if (text == null) petChanged = true; // (a new egg: written with the plays)
+  return petState;
+}
+const songSeconds = (p) => { const a = shelf.albumOf(p); return a && a.seconds ? a.seconds[a.paths.indexOf(p)] || 0 : 0; };
+function petStatsNow(now = Date.now(), fresh = false) {
+  if (!fresh && petStats && now - petStatsAt < 30e3) return petStats;
+  petStats = pet.stats({ list: listened().list, seconds: songSeconds, through: runsState().through, albumOf: shelf.albumOf, album: shelf.albumById, firsts: firstPlayedAt(), since: petNow().since, now }, petMemo);
+  petStatsAt = now;
+  return petStats;
+}
+function petMove(now = Date.now(), opts = {}) {
+  const { pet: next, events } = pet.evolve(petNow(), petStatsNow(now, true), now, opts);
+  if (JSON.stringify(next) !== JSON.stringify(petState)) { petState = next; petChanged = true; clearTimeout(playsTimer); playsTimer = setTimeout(writePlays, 1000); }
+  return events;
+}
+/** What the renderer draws and its card shows. */
+function petView(now = Date.now()) {
+  const p = petNow(), s = petStatsNow(now), look = pet.shown(p, now);
+  const diary = [
+    ...(p.hatchedAt ? [{ at: p.hatchedAt, kind: 'hatch', what: p.hatchAlbum }] : []),
+    ...Object.entries(p.found).map(([what, at]) => ({ at, kind: 'form', what })),
+    ...Object.entries(p.items).map(([what, at]) => ({ at, kind: 'item', what })),
+  ].sort((a, b) => a.at - b.at);
+  return {
+    name: p.name, ...look, temper: p.temper, since: p.since, hatchedAt: p.hatchedAt, hatchAlbum: p.hatchAlbum, chosen: p.chosen, worn: p.worn,
+    found: p.found, items: p.items, diary, favourite: s.favourite ? { title: s.favourite.title, paths: s.favourite.paths } : null,
+    lastMeal: petLastMeal || s.lastAlbum, nextLook: pet.nextLook(now), lastPlay: (listened().list[listened().list.length - 1] || [])[0] || null,
+  };
+}
+handle('pet:on', (on) => {
+  petOn = !!on;
+  if (!petOn) return null;
+  const events = petMove();
+  return { events, view: petView() };
+});
+handle('pet:get', () => (petOn ? petView() : null));
+handle('pet:set', (fields) => {
+  const p = { ...petNow() }, f = fields && typeof fields === 'object' ? fields : {};
+  if (typeof f.name === 'string') p.name = f.name.toUpperCase().replace(/[^\p{L}\p{N} ]/gu, '').trim().slice(0, 8) || 'BLIP';
+  if ('worn' in f) p.worn = f.worn && p.items[f.worn] ? f.worn : null;
+  petState = 'chosen' in f ? pet.choose(p, f.chosen) : p; petChanged = true; clearTimeout(playsTimer); playsTimer = setTimeout(writePlays, 1000);
+  return petView();
+});
+handle('plays:add', (p) => {
+  const now = Date.now();
+  listened(); // (begun before this play counts in the first and last plays it starts from)
+  const n = recordPlay({ counts: plays(), last: playedAt(), first: firstPlayedAt() }, p, now);
+  if (listens.add(listenLog, now, p)) store.writeText('listens.txt', listens.format(listens.trim(listenLog)));
+  else store.appendText('listens.txt', listens.lineOf([now, p]));
+  clearTimeout(playsTimer); playsTimer = setTimeout(writePlays, 1000);
+  // Played, its album is out of its shrink-wrap for good (not only while its play count is kept).
+  const album = shelf.albumOf(p), w = album && wrap();
+  let through = false, opened = false;
+  if (album) { through = albumRuns.heard(runsState(), album.id, album.paths.indexOf(p), album.paths.length, Date.now(), (i) => skipped().has(album.paths[i])).through; runsChanged = true; }
+  if (w && !w.torn.has(album.id)) { w.torn.add(album.id); store.writeWrap(w); opened = true; }
+  if (album) wantList.played(album.id); // a FOUND IT album heard: its card comes off the WANT LIST
+  phoneShelf = null; // the phone's shelf counts it (and shows the album unwrapped) when it's next read
+  if (!petOn) return { n, pet: null };
+  // the pet: a snack for every play, a feast for an album played through, a sniff at an album never heard before
+  if (album && album.title) petLastMeal = album.title;
+  const events = [{ kind: 'snack' }, ...(through ? [{ kind: 'feast' }] : []), ...(opened ? [{ kind: 'sniff' }] : [])];
+  const echo = pet.isEcho(listenLog.list, p, now);
+  events.push(...petMove(now, { echo }), ...(echo ? [{ kind: 'echo', title: path.basename(p).replace(/\.[^.]+$/, '') }] : []));
+  return { n, pet: { events, view: petView(now) } };
+});
+handle('plays:count', (p) => plays().get(p) || 0);
+// Songs not to play as the music moves on (SKIP in the case): passed over, still played when picked; an album heard in
+// order goes on past them (album-runs.js).
+let skippedSongs = null;
+const skipped = () => (skippedSongs = skippedSongs || store.readSkipped());
+handle('skips:list', () => [...skipped()]);
+handle('skips:set', (p, on) => {
+  if (typeof p !== 'string' || !p) return [...skipped()];
+  const s = skipped();
+  if (on) s.add(p); else s.delete(p);
+  store.writeSkipped(s);
+  return [...s];
+});
+// When each of `paths` was first and last played (ms, or null), for the booklet's pen marks.
+handle('plays:times', (paths) => {
+  const list = Array.isArray(paths) ? paths : [], first = firstPlayedAt(), last = playedAt();
+  const album = list.length ? shelf.albumOf(list[0]) : null; // and how many times their album was played through
+  return { first: list.map((p) => first.get(p) || null), last: list.map((p) => last.get(p) || null), through: album ? albumRuns.throughCount(runsState(), album.id) : 0 };
+});
+// Plays of the whole album a track is on (as the shelf groups it), or of the track alone when it isn't on the shelf,
+// and what names that disc (its shelf album, or the track) — the same for every song on it.
+handle('plays:album', (p) => {
+  const counts = plays(), album = shelf.albumOf(p);
+  return { plays: (album ? album.paths : [p]).reduce((n, t) => n + (counts.get(t) || 0), 0), disc: album ? album.id : p };
+});
+// Sound Check (sound-check.js): songs measured before, kept in soundcheck.json; and the shelf album a song is on.
+const soundCheckCache = require('./soundcheck-cache').createSoundCheckCache({
+  read: () => store.readText('soundcheck.json'),
+  write: (s) => store.writeText('soundcheck.json', s),
+  stat: (f) => { try { return fs.statSync(f); } catch { return null; } },
+});
+handle('soundcheck:get', (files) => soundCheckCache.get(Array.isArray(files) ? files.filter((f) => typeof f === 'string') : []));
+handle('soundcheck:put', (file, entry) => { if (typeof file === 'string' && entry && typeof entry === 'object') soundCheckCache.put(file, entry); });
+handle('soundcheck:album', (p) => { const a = shelf.albumOf(p); return a ? a.paths : null; });
+// Hidden tracks (hidden-track.js): what each file was found to hide, kept in hidden.json; and whether a song is the
+// last of its disc on the shelf (null: not on the shelf — the renderer goes by its tags).
+const hiddenCache = require('./hidden-cache').createHiddenCache({
+  read: () => store.readText('hidden.json'),
+  write: (s) => store.writeText('hidden.json', s),
+  stat: (f) => { try { return fs.statSync(f); } catch { return null; } },
+});
+const hiddenEntry = (e) => e && typeof e === 'object' && Number.isFinite(e.songEnd) && Number.isFinite(e.hiddenStart);
+handle('hidden:get', (file) => {
+  if (typeof file !== 'string') return { entry: undefined, lastOfDisc: null };
+  const a = shelf.albumOf(file);
+  return { entry: hiddenCache.get(file), lastOfDisc: a ? shelf.isLastOfDisc(a, file) : null };
+});
+handle('hidden:put', (file, entry) => { if (typeof file === 'string' && (entry === null || hiddenEntry(entry))) hiddenCache.put(file, entry); });
+handle('hidden:name', (d) => (d && typeof d === 'object' ? online.findHiddenName({ artist: d.artist, title: d.title, duration: Number(d.duration) }) : { name: null }));
+handle('hidden:update', (file, fields) => {
+  if (!(typeof file === 'string' && fields && typeof fields === 'object')) return;
+  hiddenCache.update(file, fields);
+  if (fields.found === true && (petOn || store.readText('pet.json') != null)) petMove(Date.now(), { hidden: true }); // the pet: GHOST
+});
+
+// AUTOMIX (automix.js): where songs measured before start, wind down and end, kept in automix.json.
+const automixCache = require('./automix-cache').createAutomixCache({
+  read: () => store.readText('automix.json'),
+  write: (s) => store.writeText('automix.json', s),
+  stat: (f) => { try { return fs.statSync(f); } catch { return null; } },
+});
+handle('automix:get', (files) => automixCache.get(Array.isArray(files) ? files.filter((f) => typeof f === 'string') : []));
+handle('automix:put', (file, edges) => { if (typeof file === 'string' && (edges === null || typeof edges === 'object')) automixCache.put(file, edges); });
+// Karaoke's words timed by the voice in the file (word-fit.js).
+const wordFit = require('./word-fit').createWordFit({
+  dir: path.join(store.dataDir(), 'karaoke-words'),
+  modelsDir: path.join(__dirname, 'karaoke', 'models').replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`),
+  fs,
+  createWorker: () => new Worker(path.join(__dirname, 'karaoke', 'worker.js').replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`)),
+});
+handle('wordFit:get', (file, lyrics) => (typeof file === 'string' && typeof lyrics === 'string' && wordFit.available() ? wordFit.get(file, lyrics) ?? 'none' : null));
+handle('wordFit:reads', (file, lyrics, lines, move) => (typeof file === 'string' && typeof lyrics === 'string' && Array.isArray(lines) && Number.isFinite(move) ? wordFit.reads(file, lyrics, lines, move) : false));
+handle('wordFit:cancel', () => wordFit.cancel());
+handle('wordFit:run', (file, lyrics, song) => {
+  if (typeof file !== 'string' || typeof lyrics !== 'string' || !song || !(song.left instanceof Float32Array) || !(song.right instanceof Float32Array) || !Array.isArray(song.lines)) return null;
+  return wordFit.run(file, lyrics, song);
+});
+// The words in Latin letters (romanize.js).
+const romanize = require('./romanize').createRomanize({
+  createWorker: () => new Worker(path.join(__dirname, 'karaoke', 'romanize-worker.js').replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`)),
+});
+handle('lyrics:romanize', (texts) => (Array.isArray(texts) && texts.length <= 5000 && texts.every((x) => typeof x === 'string') ? romanize.lines(texts) : null));
+// The now-playing card (share-card.js), onto the clipboard as a picture.
+handle('clipboard:image', (png) => clipboard.write([new ClipboardItem({ 'image/png': new Blob([png], { type: 'image/png' }) })]));
+// SHELFIE (shelfie.js): a part of the window as it is on screen — the shelf's rows, a window's height at a time.
+handle('window:capture', async (rect) => {
+  const n = (v) => Math.max(0, Math.round(Number(v) || 0));
+  const r = rect && { x: n(rect.x), y: n(rect.y), width: n(rect.width), height: n(rect.height) };
+  if (!r || !r.width || !r.height || !win || win.isDestroyed()) return null;
+  return (await win.webContents.capturePage(r)).toPNG();
+});
+// …or saved as a picture, named after the song, in the Pictures folder to start with. → true once saved.
+// The card as a video (share-video.js): saved as MP4 (or WebM), named after the song, in the Movies folder to start with.
+handle('dialog:saveVideo', async (bytes, name, ext) => {
+  const kind = ext === 'webm' ? 'webm' : 'mp4';
+  const safe = String(name || 'Now Playing').replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120) || 'Now Playing';
+  const r = await dialog.showSaveDialog(win, { title: t('Save the Video'), defaultPath: path.join(app.getPath('videos'), `${safe}.${kind}`), filters: [{ name: kind === 'mp4' ? t('MP4 video') : t('WebM video'), extensions: [kind] }] });
+  if (r.canceled || !r.filePath) return false;
+  const target = new RegExp(`\\.${kind}$`, 'i').test(r.filePath) ? r.filePath : `${r.filePath}.${kind}`;
+  fs.writeFileSync(target, Buffer.from(bytes));
+  return true;
+});
+handle('dialog:saveCard', async (png, name) => {
+  const safe = String(name || 'Now Playing').replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120) || 'Now Playing';
+  const r = await dialog.showSaveDialog(win, { title: t('Save the Card'), defaultPath: path.join(app.getPath('pictures'), `${safe}.png`), filters: [{ name: t('PNG picture'), extensions: ['png'] }] });
+  if (r.canceled || !r.filePath) return false;
+  const target = /\.png$/i.test(r.filePath) ? r.filePath : `${r.filePath}.png`;
+  fs.writeFileSync(target, Buffer.from(png));
+  return true;
+});
+// Themes people make (user-themes.js): kept, imported from a .cdtheme (chosen, or dropped on the window), exported, and
+// turned into or read from the short code.
+handle('themes:list', () => userThemes.list());
+handle('themes:save', (theme, oldName) => userThemes.save(theme, oldName || null));
+handle('themes:delete', (name) => userThemes.remove(name));
+handle('themes:import', async (source) => {
+  if (typeof source === 'string' && !/\.cdtheme$/i.test(source)) return { error: t('NOT A CDPLAYER THEME') };
+  if (typeof source !== 'string') {
+    const r = await dialog.showOpenDialog(win, { title: t('Import a Theme'), defaultPath: app.getPath('downloads'), properties: ['openFile'], filters: [{ name: t('CDPlayer theme'), extensions: ['cdtheme'] }] });
+    if (r.canceled || !r.filePaths.length) return { canceled: true };
+    source = r.filePaths[0];
+  }
+  const theme = userThemes.importFile(source);
+  return theme ? { theme } : { error: t('NOT A CDPLAYER THEME') };
+});
+handle('themes:export', async (name) => {
+  const safe = String(name || 'Theme').replace(/[\\/:*?"<>|]+/g, ' ').trim() || 'Theme';
+  const r = await dialog.showSaveDialog(win, { title: t('Export the Theme'), defaultPath: path.join(app.getPath('documents'), `${safe}.cdtheme`), filters: [{ name: t('CDPlayer theme'), extensions: ['cdtheme'] }] });
+  if (r.canceled || !r.filePath) return { canceled: true };
+  return userThemes.exportFile(name, /\.cdtheme$/i.test(r.filePath) ? r.filePath : `${r.filePath}.cdtheme`) ? { ok: true } : { error: true };
+});
+handle('themes:encode', (theme) => userThemes.encodeCode(theme));
+handle('themes:decode', (text) => userThemes.decodeCode(text));
+// Right-clicking the disc: its menu → what was chosen ('card'), or null.
+handle('menu:disc', (loaded) => new Promise((resolve) => {
+  const menu = Menu.buildFromTemplate([{ label: t('Now Playing Card…'), sublabel: 'P', enabled: !!loaded, click: () => resolve('card') }]);
+  menu.popup({ window: win, callback: () => setTimeout(() => resolve(null), 0) });
+}));
+// The Dock (macOS) or taskbar (Windows, Linux) icon: the disc that's in (drawn by dock-disc.js), or the app's own
+// icon when nothing is. On Windows the taskbar draws the button from the window's app ID, not its icon — there the disc
+// gets an ID of its own (win-taskbar-disc.js). Settings → DISC ICON turns it off for the app's own icon — on Windows it's
+// off unless turned on, as the disc there costs a pin that works.
+let dockPng = null, dockShown;
+let windowAppId = APP_ID;
+// The window's app ID, and its relaunch icon — what Windows draws its taskbar button with (the .exe's own, or a disc's).
+function setWindowAppId(id, icon) {
+  if (id === windowAppId || !win || win.isDestroyed()) return;
+  windowAppId = id;
+  const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+  win.setAppDetails({ appId: id, appIconPath: icon || exe, appIconIndex: 0, relaunchCommand: `"${exe}"`, relaunchDisplayName: 'CDPlayer' });
+  // The taskbar reads a window's ID when it makes its button: take the button away and back, so it's made anew (the
+  // window itself stays as it is).
+  if (win.isVisible() && !miniMode) { win.setSkipTaskbar(true); win.setSkipTaskbar(false); }
+}
+const taskbarDisc = process.platform === 'win32' && app.isPackaged && !smokeDir && !process.env.CDPLAYER_HOME
+  ? require('./win-taskbar-disc').createTaskbarDisc({ appId: APP_ID, dataDir: app.getPath('userData'), setWindowAppId })
+  : null;
+function showDockIcon() {
+  const png = settings.taskbarDisc ? dockPng : null;
+  if (png === dockShown) return;
+  if (dockShown === undefined && !png) { dockShown = null; return; } // the app's own icon is already there
+  if (process.platform !== 'darwin' && (!win || win.isDestroyed())) return;
+  dockShown = png;
+  const img = png ? nativeImage.createFromBuffer(Buffer.from(png)) : nativeImage.createFromPath(path.join(__dirname, '..', 'renderer', 'icon.png'));
+  if (process.platform === 'darwin') { app.dock.setIcon(img); return; }
+  win.setIcon(img); // the title bar and Alt+Tab (and the taskbar on Linux)
+  if (taskbarDisc) taskbarDisc.show(png).catch(() => {});
+}
+handle('dock:disc', (png) => { dockPng = png || null; showDockIcon(); });
+handle('dock:taskbarDisc', (on) => { settings.taskbarDisc = !!on; persistSettings(); showDockIcon(); });
+handle('online:cover', (query) => online.findCover(query));
+handle('online:coverUrl', (query) => online.findCoverUrl(query));
+// A disc's own printed picture (online.findDiscArt), kept once found — or once found not to be there.
+const discPhoto = require('./disc-photo');
+const discArtDir = () => path.join(store.dataDir(), 'disc-art');
+const discArtLookups = new Map(); // (one lookup per album at a time: a look-ahead and the real ask share it)
+handle('online:discArt', (q) => lookupDiscArt(q));
+function lookupDiscArt(q) {
+  if (!q || !q.artist || !q.album) return Promise.resolve(null);
+  const name = require('crypto').createHash('sha1').update(`4\n${q.artist}\n${q.album}`.toLowerCase()).digest('hex'); // (2: albums with an edition's name looked for again; 3: big enough for CD View; 4: the album itself, not a remix one of its name)
+  if (!discArtLookups.has(name)) discArtLookups.set(name, discArtFor(q, name).finally(() => discArtLookups.delete(name)));
+  return discArtLookups.get(name);
+}
+// A small photo kept from when the first to answer was taken: the album's others looked through once, one album at a
+// time, behind what's shown (a bigger one's there from the next start). Offline: tried again another time.
+let biggerDiscArtQueue = Promise.resolve();
+function lookForBiggerDiscArt(q, name, file) {
+  const checked = path.join(discArtDir(), `${name}.checked`);
+  if (fs.existsSync(checked)) return;
+  fs.writeFileSync(checked, ''); // (marked at once: asked twice this run, it's looked for once)
+  const width = nativeImage.createFromPath(file).getSize().width;
+  if (width >= discPhoto.GOOD_WIDTH) return;
+  biggerDiscArtQueue = biggerDiscArtQueue.then(async () => {
+    try {
+      const art = await online.findDiscArt(q);
+      if (art && nativeImage.createFromDataURL(art).getSize().width > width) fs.writeFileSync(file, Buffer.from(art.split(',')[1], 'base64'));
+    } catch { fs.rmSync(checked, { force: true }); }
+  });
+}
+async function discArtFor(q, name) {
+  const file = path.join(discArtDir(), `${name}.jpg`), none = path.join(discArtDir(), `${name}.none`);
+  if (fs.existsSync(file)) { lookForBiggerDiscArt(q, name, file); return `data:image/jpeg;base64,${fs.readFileSync(file).toString('base64')}`; }
+  // (looked again in a month — or now, if found missing before an edition was looked for under the album's own name)
+  if (fs.existsSync(none) && fs.readFileSync(none, 'utf8') === 'cut back' && Date.now() - fs.statSync(none).mtimeMs < 30 * 86400000) return null;
+  let art;
+  try { art = await online.findDiscArt(q); } catch { return null; } // (offline: looked for another time)
+  fs.mkdirSync(discArtDir(), { recursive: true });
+  if (art) { fs.writeFileSync(file, Buffer.from(art.split(',')[1], 'base64')); fs.rmSync(none, { force: true }); } else fs.writeFileSync(none, 'cut back');
+  return art;
+}
+// The real booklet's scans (online.findBookletScans), kept once found — or once found not to be there (looked for
+// again in a month). One lookup per album at a time.
+const scansDir = () => path.join(store.dataDir(), 'booklet-scans');
+const scanLookups = new Map();
+handle('online:bookletScans', (q) => {
+  if (!q || !q.artist || !q.album || shotsDir) return null;
+  const name = require('crypto').createHash('sha1').update(`1\n${q.artist}\n${q.album}`.toLowerCase()).digest('hex');
+  if (!scanLookups.has(name)) scanLookups.set(name, scansFor(q, name).finally(() => scanLookups.delete(name)));
+  return scanLookups.get(name);
+});
+async function scansFor(q, name) {
+  const dir = path.join(scansDir(), name), list = path.join(dir, 'scans.json'), none = path.join(scansDir(), `${name}.none`);
+  const read = (s) => ({ ...s, art: `data:image/jpeg;base64,${fs.readFileSync(path.join(dir, s.file)).toString('base64')}` });
+  try { return JSON.parse(fs.readFileSync(list, 'utf8')).map(read); } catch {}
+  if (fs.existsSync(none) && Date.now() - fs.statSync(none).mtimeMs < 30 * 86400000) return [];
+  let scans;
+  try { scans = await online.findBookletScans(q); } catch { return null; } // (offline: looked for another time)
+  fs.mkdirSync(scansDir(), { recursive: true });
+  if (!scans.length) { fs.writeFileSync(none, ''); return []; }
+  fs.mkdirSync(dir, { recursive: true });
+  const kept = scans.map((s, i) => {
+    const file = `${i}.jpg`;
+    fs.writeFileSync(path.join(dir, file), Buffer.from(s.art.split(',')[1], 'base64'));
+    return { file, kind: s.kind, width: s.width, height: s.height };
+  });
+  fs.writeFileSync(list, JSON.stringify(kept)); // (last: a half-written folder isn't taken for a whole one)
+  fs.rmSync(none, { force: true });
+  return scans;
+}
+handle('online:lyrics', (details) => (shotsDir ? null : online.findLyrics(details))); // (the screenshots' run is offline: the test song's own lyrics)
+handle('spotify:classify', (text) => spotify.classifySpotifyLink(text));
+handle('spotify:resolve', async (text) => {
+  try { return await spotify.resolveSpotifyLink(text); } catch (e) { return { error: (e.message || 'LOOKUP FAILED').toUpperCase() }; }
+});
+handle('spotify:signIn', () => spotify.spotifySignIn());
+// The setup wizard: are these keys real (before saving them), is the signed-in account allowed and Premium, and what to do.
+handle('spotify:checkKeys', (creds) => spotify.checkCredentials(creds || {}));
+handle('spotify:verify', () => spotify.verifyAccount());
+handle('spotify:diagnose', (code) => spotify.diagnose(code));
+// Electron 44's clipboard reads and writes are async (they may return a promise), so they're awaited.
+handle('clipboard:text', async () => String((await clipboard.readText()) || '').trim().slice(0, 200));
+handle('spotify:status', () => spotify.status());
+handle('spotify:disconnect', () => spotify.disconnect());
+handle('spotify:saveCredentials', (c) => spotify.saveCredentials(c));
+handle('spotify:accessToken', () => spotify.accessToken());
+handle('spotify:albums', (offset) => spotify.savedAlbums(offset));
+handle('spotify:playlists', (offset) => spotify.playlists(offset));
+handle('spotify:search', (query) => spotify.search(query));
+handle('spotify:discTracks', (which) => spotify.discTracks(which));
+handle('spotify:play', (request) => spotify.startPlayback(request));
+handle('spotify:cover', (url) => spotify.coverDataUrl(url));
+handle('spotify:drmReady', () => drmReady());
+// The Spotify log: each step of connecting and playing (never a token), in spotify-log.txt in the data folder, so a
+// failure on someone's PC can be traced. Each session starts with the app, the system and Widevine's state.
+const SPOTIFY_LOG = 'spotify-log.txt', SPOTIFY_LOG_MAX = 256 * 1024;
+let spotifyLogStarted = false;
+function widevineState() {
+  try {
+    const all = components && typeof components.status === 'function' ? components.status() : null;
+    const wv = all && Object.values(all).find((c) => /widevine/i.test(`${c.title || ''}`));
+    return wv ? `${wv.status || '?'} ${wv.version || ''}`.trim() : all ? 'not listed' : 'no components';
+  } catch (e) { return `unknown (${e.message})`; }
+}
+function spotifyLog(text) {
+  try {
+    const file = store.file(SPOTIFY_LOG);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    let head = '';
+    if (!spotifyLogStarted) {
+      spotifyLogStarted = true;
+      head = `\n--- CDPlayer ${APP_VERSION} · ${process.platform} ${process.arch} ${require('os').release()} · Electron ${process.versions.electron} · Widevine ${widevineState()}\n`;
+    }
+    fs.appendFileSync(file, `${head}${new Date().toISOString()} ${String(text).replace(/[\r\n]+/g, ' ').slice(0, 400)}\n`);
+    if (fs.statSync(file).size > SPOTIFY_LOG_MAX) { const all = fs.readFileSync(file); fs.writeFileSync(file, all.subarray(all.length - SPOTIFY_LOG_MAX / 2)); }
+  } catch { /* the log is a nicety */ }
+}
+handle('spotify:log', (text) => spotifyLog(text));
+handle('spotify:showLog', () => {
+  const file = store.file(SPOTIFY_LOG);
+  if (!fs.existsSync(file)) spotifyLog('(log opened before anything was played)');
+  shell.showItemInFolder(file);
+});
+handle('spotify:openDashboard', () => shell.openExternal('https://developer.spotify.com/dashboard'));
+
+handle('library:collect', async (items) => { // as the albums play: by folder, disc and track number
+  const files = await library.collectAudio(items);
+  return library.inAlbumOrder(files, await shelf.trackNumbers(files));
+});
+handle('library:scan', async () => {
+  const folders = store.musicFolders();
+  if (!folders.length) return { folder: null, files: [] };
+  const result = await library.scanLibrary(folders);
+  // What the shelf last read of each file's tags, so a search finds a song by its artist, album or title, not only
+  // by its filename, and shows it as "Artist · Title".
+  // (Never read yet: the shelf starts reading them now, in the background — this search has filenames, the next tags.)
+  if (!shelf.cacheHas(folders)) shelf.scanAlbums().catch(() => null);
+  const read = shelf.readCache(folders) || {}, tags = {};
+  for (const p of result.files) {
+    const i = read[p] && read[p].info;
+    if (i && i.title) tags[p] = { words: [i.artist, i.albumArtist, i.album, i.title, i.year].filter(Boolean).join(' '), shown: i.artist ? `${i.artist} · ${i.title}` : i.title };
+  }
+  return { folder: folders[0], name: shelf.folderNames(folders), ...result, tags };
+});
+
+// Tags: what's in the file, what MusicBrainz says, and writing changes (and found covers and lyrics) into it.
+handle('tags:read', (p) => {
+  if (!tagWriter.canWrite(p)) return { canWrite: false };
+  try { return { canWrite: true, tags: tagWriter.readTags(p) }; } catch { return { canWrite: false }; }
+});
+handle('tags:lookup', (details) => online.lookupTags(details));
+handle('tags:coverFromUrl', (url) => online.coverFromUrl(url));
+// The tags a file had before they were first written over (tags-before.js), for PUT BACK THE ORIGINAL.
+const tagsBefore = require('./tags-before');
+const TAGS_BEFORE = 'tags-before.json';
+handle('tags:write', async (p, changes) => {
+  let now = null;
+  try { if (tagWriter.canWrite(p) && changes && typeof changes === 'object') now = tagWriter.readTags(p); } catch { /* written or not, as before */ }
+  const result = await tagWriter.writeTags(p, changes);
+  if (result.ok) {
+    metadata.forget(p); shelf.forget(p);
+    if (now) store.writeText(TAGS_BEFORE, JSON.stringify(tagsBefore.remember(tagsBefore.parse(store.readText(TAGS_BEFORE)), p, now, changes)));
+  }
+  return result;
+});
+handle('tags:original', (p) => {
+  try { return tagWriter.canWrite(p) ? tagsBefore.original(tagsBefore.parse(store.readText(TAGS_BEFORE)), p, tagWriter.readTags(p)) : null; } catch { return null; }
+});
+handle('tags:forgetOriginal', (p) => {
+  const r = tagsBefore.parse(store.readText(TAGS_BEFORE));
+  if (r[p]) { delete r[p]; store.writeText(TAGS_BEFORE, JSON.stringify(r)); }
+});
+// The music folders, watched so an open shelf keeps up with them (library-watch.js); they follow the folders the shelf reads.
+const libraryWatch = require('./library-watch').createLibraryWatch({ onChange: () => {
+  phoneShelf = null; // the phone remote's list is read again when it's next asked for
+  if (wantList.waiting()) lookForWanted();
+  if (win && !win.isDestroyed()) win.webContents.send('library-changed');
+} });
+const watchMusicFolder = () => { if (!smokeDir) libraryWatch.start(store.musicFolders()); };
+// The shelf's albums with plays, dust, notes and shrink-wrap added; the handler and the phone remote both read it.
+async function shelfListing() {
+  watchMusicFolder();
+  const result = await shelf.scanAlbums((done, total) => { if (win && !win.isDestroyed()) win.webContents.send('shelf-progress', { done, total }); });
+  // How many times each album's songs have been played, for the shelf's MOST PLAYED order.
+  const counts = plays();
+  for (const a of result.albums) a.plays = a.tracks.reduce((n, t) => n + (counts.get(t.path) || 0), 0);
+  // …and when each was last played or wiped, for its dust.
+  const touch = { ...dust(), lastPlayed: playedAt() };
+  for (const a of result.albums) a.touched = shelf.touchedAt(a, touch);
+  // …and when a song of it was last played, for LAST PLAYED.
+  for (const a of result.albums) a.lastPlayed = a.tracks.reduce((m, t) => Math.max(m, touch.lastPlayed.get(t.path) || 0), 0) || null;
+  const notes = store.readNotes();
+  for (const a of result.albums) a.note = notes.get(a.id) || null;
+  const dividers = store.readDividers();
+  for (const a of result.albums) a.filedUnder = dividers.get(a.id) || null;
+  // …and which came in shrink-wrap (new since wrapping began, not played yet, not unwrapped by hand).
+  const w = wrap();
+  for (const a of result.albums) a.wrapped = shelf.isWrapped(a, w);
+  // …and which turned up off the WANT LIST: crossed off, and FOUND IT on them until they're played.
+  wantFound(wantList.crossOff(result.albums));
+  const foundIt = wantList.foundIds();
+  for (const a of result.albums) a.foundIt = foundIt.has(a.id) && !a.plays;
+  // …and where one was left part-way through (a bookmark), and how many times each was played through.
+  const r = runsState();
+  for (const a of result.albums) { a.bookmark = albumRuns.bookmark(r, a.id, a.tracks.length); a.through = albumRuns.throughCount(r, a.id); }
+  // ON THIS DAY: the day each came out (as a story looked up before says, else its tags), and how many years ago it
+  // was played on this day — nothing asked online for it.
+  const releasedOf = albumStory.releaseDates(), playedThen = listens.onThisDay(listened());
+  for (const a of result.albums) {
+    a.released = releasedOf(a) || a.released || null;
+    a.playedYearsAgo = a.tracks.reduce((m, t) => { const y = playedThen.get(t.path); return y && (!m || y < m) ? y : m; }, null);
+  }
+  result.hiddenMissing = [...store.readHiddenMissing()];
+  result.moves = movedSongs(result.albums);
+  return result;
+}
+handle('shelf:albums', async () => { const result = await shelfListing(); warmDiscArt(result.albums); return result; });
+// The shelf's discs' pictures looked up in the background (two at a time, the albums played lately first), so a disc
+// put in has its picture already — not seconds later. Each album once a session; one found, or found missing, is kept.
+// …and, a while after the start, without waiting for the shelf to be opened.
+if (!smokeDir) app.whenReady().then(() => setTimeout(() => shelf.scanAlbums(() => {}).then((r) => warmDiscArt(r.albums)).catch(() => {}), 30000));
+const discArtWarmed = new Set(), discArtWaiting = [];
+let discArtWarming = 0;
+function warmDiscArt(albums) {
+  const order = [...albums].filter((a) => a.artist && a.title).sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0) || (b.plays || 0) - (a.plays || 0));
+  for (const a of order) {
+    const key = `${a.artist}\n${a.title}`.toLowerCase();
+    if (discArtWarmed.has(key)) continue;
+    discArtWarmed.add(key);
+    discArtWaiting.push({ artist: a.artist, album: a.title, releaseId: a.mbReleaseId || null });
+  }
+  while (discArtWarming < 2 && discArtWaiting.length) {
+    discArtWarming++;
+    const next = () => { const q = discArtWaiting.shift(); if (!q) { discArtWarming--; return; } lookupDiscArt(q).catch(() => null).then(() => setTimeout(next, 500)); };
+    next();
+  }
+}
+// THE YEAR ON THE SHELF (year-shelf.js): a year of listening (a number), or 'ALL'.
+handle('year:shelf', async (year) => {
+  const { albums } = await shelf.scanAlbums(() => {});
+  const y = year === 'ALL' ? 'ALL' : Number.isInteger(year) ? year : new Date().getFullYear();
+  return yearOnShelf({ log: listened(), albums, counts: plays(), through: runsState().through, year: y });
+});
+// Songs moved (relocate.js): what's kept by their old paths — plays, HISTORY — found again on the shelf, a folder at a
+// time, for the shelf to offer to bring along. Nothing moves until it's asked to.
+let movesFound = null;
+let shelfIds = new Set(); // the albums on the shelf when the moves were found, by id
+function movedSongs(albums) {
+  const present = new Set(albums.flatMap((a) => a.tracks.map((t) => t.path)));
+  const known = new Set([...plays().keys(), ...playedAt().keys(), ...firstPlayedAt().keys(), ...store.readHistoryAll(), ...skipped()]); // (a song marked SKIP may never have played)
+  movesFound = relocate.findMoves([...known].filter((p) => !present.has(p) && !cue.entryExists(p)), present);
+  shelfIds = new Set(albums.map((a) => a.id));
+  const declined = store.readMovesDeclined();
+  return movesFound.groups.filter((g) => !declined.has(g.key));
+}
+handle('moves:apply', (key) => {
+  const group = movesFound && movesFound.groups.find((g) => g.key === key);
+  if (!group) return 0;
+  const moves = relocate.movesOf(movesFound, key);
+  clearTimeout(playsTimer);
+  listened();
+  ({ counts: playCounts, last: lastPlayed, first: firstPlayed } = relocate.movePlays({ counts: plays(), last: playedAt(), first: firstPlayedAt() }, moves));
+  writePlays();
+  listens.move(listenLog, moves); store.writeText('listens.txt', listens.format(listenLog));
+  store.writeHistoryAll(relocate.newestFirst(relocate.moveHistory(store.readHistoryAll(), moves), lastPlayed));
+  // An album known by its folder (no tags to know it by) takes its sticky note, its dust and its wrapping along.
+  // (Not one still on the shelf by its id: the group's from → to can be a folder many albums share — "Rock" → "Archive"
+  // when one album of Rock's moved — and the others stayed.)
+  const moveId = (id) => (shelfIds.has(id) ? id : relocate.moveAlbumId(id, group.from, group.to));
+  store.writeNotes(new Map([...store.readNotes()].map(([id, text]) => [moveId(id), text])));
+  store.writeDividers(new Map([...store.readDividers()].map(([id, name]) => [moveId(id), name])));
+  const d = dust(); d.wiped = new Map([...d.wiped].map(([id, t]) => [moveId(id), t])); store.writeDust(d);
+  const w = wrap(); w.torn = new Set([...w.torn].map(moveId)); store.writeWrap(w);
+  runs = albumRuns.moveIds(runsState(), moveId); store.writeText('album-runs.json', JSON.stringify(runs));
+  skippedSongs = new Set([...skipped()].map((p) => moves.get(p) || p)); store.writeSkipped(skippedSongs);
+  movesFound = null;
+  phoneShelf = null;
+  return moves.size;
+});
+// BACKUP (backup.js): what's yours in CDPlayer saved to a .cdbackup file, and put back from one — CDPlayer then starts
+// again with it.
+const backup = require('./backup');
+const BACKUP_FILTER = () => [{ name: t('CDPlayer backup'), extensions: ['cdbackup'] }];
+handle('backup:save', async () => {
+  if (playsTimer) { clearTimeout(playsTimer); writePlays(); }
+  const day = new Date().toISOString().slice(0, 10);
+  const r = await dialog.showSaveDialog(win, { defaultPath: path.join(app.getPath('documents'), `CDPlayer ${day}.cdbackup`), filters: BACKUP_FILTER() });
+  if (r.canceled || !r.filePath) return null;
+  const target = /\.cdbackup$/i.test(r.filePath) ? r.filePath : `${r.filePath}.cdbackup`;
+  try { fs.writeFileSync(target, backup.make(store.dataDir(), { version: APP_VERSION })); return { ok: true }; } catch { return { error: true }; }
+});
+// Once a day by itself as well (backup.keepDaily), a minute after starting and then every few hours it stays open.
+function dailyBackup() {
+  if (smokeDir || !gotLock) return;
+  if (playsTimer) { clearTimeout(playsTimer); writePlays(); }
+  try { backup.keepDaily(store.dataDir(), { version: APP_VERSION }); } catch { /* a full disk: tomorrow */ }
+}
+handle('backup:restore', async () => {
+  const daily = backup.dailyDir(store.dataDir());
+  const r = await dialog.showOpenDialog(win, { properties: ['openFile'], filters: BACKUP_FILTER(), ...(fs.existsSync(daily) ? { defaultPath: daily } : {}) });
+  const p = !r.canceled && r.filePaths && r.filePaths[0];
+  if (!p) return null;
+  let b = null;
+  try { if (fs.statSync(p).size < 400 * 1024 * 1024) b = backup.read(fs.readFileSync(p, 'utf8')); } catch { /* unreadable */ }
+  if (!b) return { error: 'NOT A BACKUP' };
+  const when = b.made ? new Date(b.made).toLocaleString(i18n.current().code) : '?';
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'question', buttons: [t('Restore and restart'), t('Cancel')], defaultId: 1, cancelId: 1,
+    message: t('Put back the backup from {when}?', { when }),
+    detail: t('Your queue, history, plays, notes, themes and settings become the ones it kept. What’s there now is copied into the before-restore folder first. Spotify and Discogs stay signed in.'),
+  });
+  if (response !== 0) return null;
+  if (playsTimer) { clearTimeout(playsTimer); writePlays(); }
+  store.freeze(); // the queue, the window and the plays aren't saved on the way out over what's put back
+  try { backup.restore(store.dataDir(), b); } catch { store.freeze(false); return { error: 'UNKNOWN ERROR' }; }
+  app.relaunch();
+  app.quit();
+  return { ok: true };
+});
+// COPY REPORT (renderer/js/report.js): what the main process knows of the system.
+handle('app:reportInfo', async (streamingOn) => ({
+  os: `${process.platform} ${process.getSystemVersion()} ${process.arch}`, electron: process.versions.electron, chrome: process.versions.chrome,
+  gpu: softwareRendering() ? 'software' : 'hardware', folders: store.musicFolders().length,
+  ytdlp: streamingOn ? await streaming.available(10000) : null,
+}));
+// Scrobbling to ListenBrainz and Last.fm (scrobble.js): songs heard, and the one playing now; what waited sent every 10
+// minutes too.
+const scrobbler = require('./scrobble').createScrobbler({ store, version: APP_VERSION,
+  onDropped: (service) => { if (win && !win.isDestroyed()) win.webContents.send('scrobble-dropped', service); } });
+handle('scrobble:status', () => scrobbler.status());
+handle('scrobble:signIn', (token) => scrobbler.signIn(typeof token === 'string' ? token : ''));
+handle('scrobble:connectLastfm', () => scrobbler.connectLastfm((url) => shell.openExternal(url)));
+handle('scrobble:signOut', (service) => scrobbler.signOut(service === 'lastfm' ? 'lastfm' : 'listenbrainz'));
+handle('scrobble:openTokenPage', () => shell.openExternal('https://listenbrainz.org/settings/'));
+ipcMain.on('scrobble:nowPlaying', (_e, song) => { if (!smokeDir) scrobbler.nowPlaying(song || {}); });
+ipcMain.on('scrobble:heard', (_e, song) => { if (!smokeDir) scrobbler.scrobble(song || {}); });
+setInterval(() => { if (Object.values(scrobbler.status()).some((s) => s.waiting)) scrobbler.flush(); }, 10 * 60e3);
+// Each output's own sound (renderer/js/device-sound.js), by the device's name.
+handle('sound:devices', () => { try { return JSON.parse(store.readText('device-sound.json') || '{}'); } catch { return {}; } });
+handle('sound:saveDevices', (kept) => { if (kept && typeof kept === 'object') store.writeText('device-sound.json', JSON.stringify(kept)); });
+// IMPORT PLAYS (import-plays.js): plays from Last.fm, ListenBrainz, Spotify or Apple Music added to the songs on the shelf.
+const importPlays = require('./import-plays');
+handle('plays:import', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: t('Plays from Last.fm, ListenBrainz, Spotify or Apple Music'), extensions: ['zip', 'json', 'jsonl', 'csv', 'xml'] }],
+  });
+  if (r.canceled || !r.filePaths || !r.filePaths.length) return null;
+  // (a big history takes a while: the status line says what it's doing — reading, then matching against the shelf)
+  const tell = (p) => { if (win && !win.isDestroyed()) win.webContents.send('import-progress', p); };
+  const found = [];
+  for (const p of r.filePaths) {
+    tell({ stage: 'reading' });
+    await new Promise((done) => setImmediate(done)); // (said before the reading holds things up)
+    try { if (fs.statSync(p).size < 1024 * 1024 * 1024) found.push(...importPlays.read({ name: path.basename(p), data: fs.readFileSync(p) })); } catch { /* unreadable */ }
+  }
+  if (!found.length) return { error: 'NOT RECOGNISED' };
+  tell({ stage: 'matching', done: 0, total: 0 });
+  const { albums } = await shelf.scanAlbums((done, total) => tell({ stage: 'matching', done, total }));
+  let before = {};
+  try { before = JSON.parse(store.readText('imports.json') || '{}'); } catch { /* none yet */ }
+  clearTimeout(playsTimer);
+  const done = importPlays.apply(found, albums, { counts: plays(), last: playedAt(), first: firstPlayedAt() }, before, { own: scrobbler.ownSince() });
+  listened(); // (begun from the plays as they were, before these)
+  ({ counts: playCounts, last: lastPlayed, first: firstPlayed } = done.plays);
+  writePlays();
+  store.writeText('imports.json', JSON.stringify(done.imports));
+  if (done.timed.length) logPlays(done.timed);
+  // Their songs in HISTORY, each at its last play — those played here since stay above them.
+  if (done.songs.length) store.writeHistoryAll(relocate.newestFirst([...new Set([...store.readHistoryAll(), ...done.songs])], lastPlayed));
+  phoneShelf = null;
+  if (done.added && win && !win.isDestroyed()) win.webContents.send('library-changed'); // the shelf's plays and dust
+  return { added: done.added, songs: done.songs.length, already: done.already, missing: done.missing, sources: done.sources };
+});
+handle('moves:decline', (key) => {
+  if (typeof key !== 'string' || !key.includes('\n')) return;
+  const declined = store.readMovesDeclined(); declined.add(key); store.writeMovesDeclined(declined);
+});
+// Missing albums (discography.js): each artist's official releases from MusicBrainz, for the artists on screen.
+const discography = require('./discography').createDiscography({
+  mbFetch: (q) => require('./online').mbFetch(q),
+  onAnswer: (answer) => { if (win) win.webContents.send('discography', answer); },
+});
+handle('discography:want', (artists) => discography.want(Array.isArray(artists) ? artists.slice(0, 200) : []));
+handle('discography:tracklist', (groupId) => discography.tracklist(groupId));
+// The booklet's "About the album" pages (album-story.js), in the interface's language.
+const albumStory = require('./album-story').createAlbumStory({ mbFetch: (q) => online.mbFetch(q), fetchJson: (url, init) => online.fetchJson(url, init), findGroup: (q) => online.musicBrainzAlbum(q) });
+// MusicBrainz or Wikipedia busy or out of reach: { unavailable } (nothing's remembered; the booklet asks again).
+handle('story:album', (q) => albumStory.storyFor({ ...(q || {}), lang: i18n.current().code }).catch(() => ({ unavailable: true })));
+handle('story:open', (url) => { if (/^https:\/\/[a-z-]+\.wikipedia\.org\/wiki\//.test(String(url))) shell.openExternal(url); });
+handle('discography:of', (a) => discography.discographyFor({ artist: String((a && a.artist) || ''), mbid: (a && a.mbid) || null }));
+// FROM YOUR SHELF (similar-artists.js): the artists Last.fm finds like one, for IF YOU LIKE THIS and KEEP IT FULL.
+const similarArtists = require('./similar-artists').createSimilarArtists();
+handle('similar:artists', (artist) => (smokeDir || typeof artist !== 'string' ? [] : similarArtists.similarTo(artist.slice(0, 300))));
+// Discogs (discogs.js): an album's pressing and price when its case is opened, the whole shelf when it's appraised.
+const discogs = require('./discogs').createDiscogs({ fetchJson: (url, init) => require('./online').fetchJson(url, init), mbFetch: (q) => require('./online').mbFetch(q), userAgent: `CDPlayer/${APP_VERSION} +https://github.com/Kizarov3/CDPlayer` });
+const albumQuery = (a) => (a && typeof a === 'object' && typeof a.id === 'string' ? { id: a.id, artist: a.artist || null, title: a.title || null, year: a.year || null, barcode: a.barcode || null, catalog: a.catalog || null, label: a.label || null, mbReleaseId: a.mbReleaseId || null } : null);
+const offline = (e) => ({ error: e && e.status ? 'DISCOGS' : 'OFFLINE' });
+handle('discogs:lookup', (a) => { const q = albumQuery(a); return q ? discogs.lookup(q).catch(offline) : null; });
+handle('discogs:appraise', (list) => discogs.appraise((Array.isArray(list) ? list : []).map(albumQuery).filter(Boolean), (p) => { if (win) win.webContents.send('discogs-progress', p); }));
+handle('discogs:stop', () => discogs.stopAppraise());
+handle('discogs:versions', (id) => discogs.versions(id).catch(offline));
+handle('discogs:search', (a) => { const q = albumQuery(a); return q ? discogs.search(q).catch(offline) : []; });
+handle('discogs:choose', (a, id) => { const q = albumQuery(a); return q && Number(id) > 0 ? discogs.choose(q, id).catch(offline) : null; });
+handle('discogs:known', (ids) => discogs.known(Array.isArray(ids) ? ids : []));
+handle('discogs:notFound', (ids) => discogs.notFound(Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : null));
+handle('discogs:settings', () => discogs.settings());
+handle('discogs:setToken', (token, opts) => discogs.setToken(typeof token === 'string' ? token : null, { paste: !!(opts && opts.paste) }));
+handle('discogs:setCurrency', (code) => discogs.setCurrency(code));
+handle('discogs:open', (uri) => { if (/^https:\/\/www\.discogs\.com\//.test(String(uri))) shell.openExternal(uri); });
+handle('discography:hide', (groupId) => { const hidden = store.readHiddenMissing(); hidden.add(String(groupId)); store.writeHiddenMissing(hidden); });
+handle('discography:open', (groupId) => { if (/^[0-9a-f-]{36}$/.test(groupId)) shell.openExternal(`https://musicbrainz.org/release-group/${groupId}`); });
+// A search on YouTube Music, in the browser or its app: playing it inside CDPlayer isn't possible within YouTube's rules.
+handle('youtubeMusic:open', (query) => { const q = String(query || '').trim().slice(0, 300); if (q) shell.openExternal(`https://music.youtube.com/search?q=${encodeURIComponent(q)}`); });
+// The WANT LIST (want-list.js): albums you don't have yet, put on it from their ghost cases on the shelf, each with its
+// lowest Discogs price (asked again after a week at most); crossed off by themselves when they turn up in the music folder.
+const wantList = require('./want-list').createWantList();
+const wantQuery = (x) => ({ id: `want:${x.key}`, artist: x.artist, title: x.title, year: x.year || null });
+// Crossed off just now: said in the status line.
+function wantFound(found) {
+  if (found.length && win && !win.isDestroyed()) win.webContents.send('want-found', found.map((x) => ({ artist: x.artist, title: x.title })));
+}
+// The music folder changed with the shelf closed, maybe: it's read (only what changed is) to see if a wanted album came.
+let wantTimer = null;
+function lookForWanted() {
+  clearTimeout(wantTimer);
+  wantTimer = setTimeout(() => { shelf.scanAlbums().then((r) => wantFound(wantList.crossOff(r.albums))).catch(() => {}); }, 1500);
+}
+handle('want:list', () => {
+  const items = wantList.list();
+  return { items, prices: discogs.known(items.map((x) => wantQuery(x).id)) };
+});
+handle('want:add', (x) => wantList.add(x && typeof x === 'object' ? { artist: x.artist, title: x.title, year: x.year, groupId: x.groupId } : null));
+handle('want:remove', (key) => wantList.remove(key));
+handle('want:price', (key) => {
+  const x = wantList.list().find((i) => i.key === key);
+  return x ? discogs.lookup(wantQuery(x), { priceDays: 7 }).catch(offline) : null;
+});
+// Shrink-wrap on new albums: from the first time the shelf was read with it; unwrapped album by album.
+let wrapState = null;
+function wrap() {
+  if (!wrapState) {
+    wrapState = store.readWrap();
+    if (!wrapState.since) { wrapState.since = Date.now(); store.writeWrap(wrapState); }
+  }
+  return wrapState;
+}
+handle('wrap:tear', (id) => { const w = wrap(); if (typeof id === 'string' && !w.torn.has(id)) { w.torn.add(id); store.writeWrap(w); phoneShelf = null; } });
+// Dust on the shelf: gathering since the first time the shelf was read with it, wiped album by album.
+let dustState = null;
+function dust() {
+  if (!dustState) {
+    dustState = store.readDust();
+    if (!dustState.since) { dustState.since = Date.now(); store.writeDust(dustState); }
+  }
+  return dustState;
+}
+// A sticky note on an album; an empty one peels it off.
+handle('notes:set', (id, text) => {
+  const notes = store.readNotes();
+  if (text) notes.set(id, text); else notes.delete(id);
+  store.writeNotes(notes);
+});
+// An album filed behind one of the user's own dividers (MY DIVIDERS on the shelf); none takes it out from behind it.
+handle('dividers:set', (id, name) => {
+  const dividers = store.readDividers();
+  if (name) dividers.set(id, name); else dividers.delete(id);
+  store.writeDividers(dividers);
+  phoneShelf = null;
+});
+handle('dust:wipe', (id) => { const d = dust(), t = Date.now(); d.wiped.set(id, t); store.writeDust(d); return t; });
+// LIBRARY CHECK (the shelf): what's wrong in the music folder — from the tags already read (library-check.js), and
+// which albums have no cover on this computer. Progress as 'library-check' events.
+handle('library:check', async () => {
+  const send = (done, total) => { if (win) win.webContents.send('library-check', { done, total }); };
+  const scanned = await shelf.scanAlbums(send);
+  if (!scanned.folder) return null;
+  const cached = shelf.readCache(scanned.folders) || {};
+  const issues = require('./library-check').libraryIssues(Object.entries(cached).map(([p, e]) => ({ path: p, info: e.info })));
+  const noCover = [];
+  let done = 0;
+  for (const a of scanned.albums) {
+    if (!(await shelf.albumCover(a.tracks[0].path, { online: false, local: true }))) {
+      noCover.push({ album: a.title, artist: a.artist, title: a.tracks[0].title, folder: a.folder, paths: a.tracks.map((t) => t.path) });
+    }
+    if (++done % 20 === 0) send(done, scanned.albums.length);
+  }
+  return { ...issues, noCover, folder: scanned.folder };
+});
+handle('shell:showFile', (p) => { if (typeof p === 'string' && fs.existsSync(cue.parseRef(p) ? cue.parseRef(p).cuePath : p)) shell.showItemInFolder(cue.parseRef(p) ? cue.parseRef(p).cuePath : p); });
+handle('shelf:cover', (firstTrack, opts) => shelf.albumCover(firstTrack, { online: !(opts && opts.online === false) }));
+// The colours the shelf worked out from covers (spines, and SORT: COLOR), kept between launches.
+handle('shelf:colors', () => store.readShelfColors());
+handle('shelf:saveColors', (colors) => { if (colors && typeof colors === 'object') store.writeShelfColors(colors); });
+handle('shelf:coverFull', (firstTrack) => shelf.albumCoverFull(firstTrack));
+// The shelf's FOLDER…: the folders it reads. `add`: one more (an external drive, say) — one inside a folder already
+// read changes nothing, and the folders inside a new one become part of it; otherwise the one picked replaces them.
+handle('dialog:pickMusicFolder', async (mode) => {
+  const adding = mode === 'add';
+  const r = await dialog.showOpenDialog(win, { title: adding ? t('Add a Music Folder') : t('Your Music Folder'), defaultPath: dialogDefaultPath(), properties: ['openDirectory'] });
+  if (r.canceled || !r.filePaths.length) return null;
+  const dir = r.filePaths[0], within = (p, d) => p === d || p.startsWith(d.endsWith(path.sep) ? d : d + path.sep);
+  const now = store.readMusicFolders();
+  if (!adding) store.writeMusicFolders([dir]);
+  else if (!now.some((f) => within(dir, f))) store.writeMusicFolders([...now.filter((f) => !within(f, dir)), dir]);
+  store.writeLastPath(dir);
+  return dir;
+});
+handle('music:folders', () => store.readMusicFolders().map((f) => ({ path: f, name: path.basename(f) || f, there: store.isDir(f) })));
+handle('music:removeFolder', (dir) => { store.writeMusicFolders(store.readMusicFolders().filter((f) => f !== dir)); });
+
+function dialogDefaultPath() {
+  const last = store.readLastPath();
+  return last && store.isDir(last) ? last : app.getPath('music');
+}
+const audioFilter = () => ({ name: t('Audio files (MP3, M4A, FLAC, WAV, AIFF, AU, OGG, Opus) and CUE sheets'), extensions: [...library.AUDIO_EXTENSIONS, 'cue'] });
+
+handle('dialog:openTracks', async () => {
+  // macOS can pick files and folders in one dialog; Windows/Linux dialogs are one or the other, so pick files there
+  // (folders can still be dragged onto the window).
+  const properties = ['openFile', 'multiSelections'];
+  if (process.platform === 'darwin') properties.push('openDirectory');
+  const r = await dialog.showOpenDialog(win, { title: t('Load a Track'), defaultPath: dialogDefaultPath(), properties, filters: [audioFilter()] });
+  if (r.canceled || !r.filePaths.length) return [];
+  const first = r.filePaths[0], dir = store.isDir(first) && r.filePaths.length === 1 ? first : path.dirname(first);
+  store.writeLastPath(dir);
+  if (store.noMusicFolderYet()) store.writeMusicFolders([dir]); // no music folder yet: the shelf starts with this one
+  return r.filePaths;
+});
+handle('dialog:savePlaylist', async (entries, name) => {
+  const file = `${String(name || 'playlist').replace(/[\\/:*?"<>|\r\n]+/g, ' ').trim().slice(0, 120) || 'playlist'}.m3u`; // (a streamed playlist: its own name)
+  const r = await dialog.showSaveDialog(win, { title: t('Save Playlist'), defaultPath: path.join(dialogDefaultPath(), file), filters: [{ name: t('Playlist (M3U)'), extensions: ['m3u', 'm3u8'] }] });
+  if (r.canceled || !r.filePath) return { ok: false, canceled: true };
+  let target = r.filePath;
+  if (!/\.m3u8?$/i.test(target)) target += '.m3u';
+  try {
+    fs.writeFileSync(target, library.formatM3u(entries), 'utf8');
+    store.writeLastPath(path.dirname(target));
+    return { ok: true, name: path.basename(target) };
+  } catch { return { ok: false }; }
+});
+handle('dialog:loadPlaylist', async () => {
+  const r = await dialog.showOpenDialog(win, { title: t('Load Playlist'), defaultPath: dialogDefaultPath(), properties: ['openFile'], filters: [{ name: t('Playlist (M3U)'), extensions: ['m3u', 'm3u8'] }] });
+  if (r.canceled || !r.filePaths.length) return { canceled: true };
+  const source = r.filePaths[0];
+  store.writeLastPath(path.dirname(source));
+  try {
+    // Streamed songs come back too, by their pages, named as the playlist named them till they're looked up.
+    const names = {}, tracks = library.parseM3u(fs.readFileSync(source, 'utf8'), source, { isStream: streaming.isStreamPage, names });
+    for (const [page, title] of Object.entries(names)) if (!streaming.songInfo(page)) streaming.remember(page, { title });
+    return { tracks, name: path.basename(source).replace(/\.m3u8?$/i, '') };
+  } catch { return { error: true }; }
+});
+handle('dialog:importLibrary', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: t('Import Library'), defaultPath: dialogDefaultPath(), properties: ['openFile'],
+    filters: [{ name: t('Library export (iTunes XML, Spotify CSV/JSON)'), extensions: ['xml', 'csv', 'json'] }],
+  });
+  if (r.canceled || !r.filePaths.length) return { canceled: true };
+  const source = r.filePaths[0];
+  try {
+    const text = fs.readFileSync(source, 'utf8');
+    const ext = path.extname(source).toLowerCase();
+    if (ext === '.xml') return { kind: 'itunes', tracks: library.parseItunesLibrary(text) };
+    return { kind: 'spotify', tracks: ext === '.json' ? library.parseSpotifyJson(text) : library.parseSpotifyCsv(text) };
+  } catch { return { error: true }; }
+});
+
+// ---- Mini player -------------------------------------------------------------------------------------------------
+// A separate small frameless window, like Apple Music's mini player. The main window keeps doing all the playing
+// (it's just hidden); the mini window is a remote control that mirrors its state over IPC.
+
+function miniPositionOnScreen(p) {
+  return p && screen.getAllDisplays().some(({ workArea: a }) => p.x >= a.x - MINI.width / 2 && p.x <= a.x + a.width - MINI.width / 2 && p.y >= a.y && p.y <= a.y + a.height - 40);
+}
+// Its size: dragged by an edge or a corner, bigger or smaller, the same shape (the page scaled to it, mini.js).
+const MINI_WIDTHS = [260, 460];
+const miniSize = (width) => {
+  const w = Math.round(Math.min(MINI_WIDTHS[1], Math.max(MINI_WIDTHS[0], width || MINI.width)));
+  return { width: w, height: Math.round(w * MINI.height / MINI.width) };
+};
+function readMiniSize() {
+  const parts = (store.readText(store.FILES.miniPosition) || '').trim().split(',').map((v) => parseInt(v, 10));
+  return miniSize(parts[2]);
+}
+function readMiniPosition() {
+  const parts = (store.readText(store.FILES.miniPosition) || '').trim().split(',').map((v) => parseInt(v, 10));
+  const saved = parts.length >= 2 && parts.slice(0, 2).every(Number.isFinite) ? { x: parts[0], y: parts[1] } : null;
+  if (miniPositionOnScreen(saved)) return saved;
+  // First time: top-right corner of whichever display the main window is on.
+  const { workArea: a } = screen.getDisplayMatching(win ? win.getBounds() : { x: 0, y: 0, width: 1, height: 1 });
+  return { x: a.x + a.width - readMiniSize().width - 24, y: a.y + 24 };
+}
+function saveMiniPlace() {
+  const [x, y] = miniWin.getPosition();
+  store.writeText(store.FILES.miniPosition, `${x},${y},${miniWin.getSize()[0]}`);
+}
+
+function createMiniWindow() {
+  miniWin = new BrowserWindow({
+    ...readMiniSize(), ...readMiniPosition(),
+    frame: false,
+    resizable: true, maximizable: false, fullscreenable: false,
+    minWidth: MINI_WIDTHS[0], minHeight: miniSize(MINI_WIDTHS[0]).height,
+    maxWidth: MINI_WIDTHS[1], maxHeight: miniSize(MINI_WIDTHS[1]).height,
+    alwaysOnTop: true,
+    show: false,
+    hasShadow: true,
+    roundedCorners: true,
+    transparent: true,
+    backgroundColor: '#00000000', // (the page paints its own panel, in the theme's colours, round-cornered)
+    title: 'CDPlayer',
+    icon: process.platform === 'linux' ? path.join(__dirname, '..', 'renderer', 'icon.png') : undefined,
+    webPreferences: {
+      preload: path.join(__dirname, '..', 'preload.js'),
+      contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false, spellcheck: false,
+    },
+  });
+  miniWin.setAlwaysOnTop(true, 'floating');
+  // (On macOS this would make CDPlayer a background app with no Dock icon — for good, even after the mini player: kept.)
+  miniWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
+  miniWin.setAspectRatio(MINI.width / MINI.height);
+  miniWin.on('moved', saveMiniPlace);
+  miniWin.on('resized', saveMiniPlace);
+  // Closing the mini player (Cmd+W, or from the taskbar) goes back to the full window rather than quitting.
+  miniWin.on('close', (e) => {
+    if (quitting) return;
+    e.preventDefault();
+    if (win) win.webContents.send('mini-command', { action: 'exit' });
+  });
+  miniWin.on('closed', () => { miniWin = null; });
+  miniWin.webContents.on('will-navigate', (e) => e.preventDefault());
+  miniWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  const ready = new Promise((resolve) => miniWin.webContents.once('did-finish-load', resolve));
+  miniWin.loadURL('cdp://app/mini.html');
+  return ready;
+}
+
+handle('win:setMiniMode', async (enabled) => {
+  if (!win || enabled === miniMode) return;
+  miniMode = enabled;
+  if (enabled) {
+    if (win.isFullScreen()) {
+      await new Promise((resolve) => { win.once('leave-full-screen', resolve); win.setFullScreen(false); setTimeout(resolve, 1500); });
+    }
+    if (!miniWin) await createMiniWindow();
+    miniWin.setPosition(...Object.values(readMiniPosition()));
+    miniWin.webContents.send('mini-state', { appear: true }); // (its coming-up animation, under way as it's shown)
+    if (shotsDir) miniWin.showInactive(); else miniWin.show(); // (the screenshots' run never takes the focus)
+    win.hide();
+  } else {
+    // (the screenshots' run keeps its window hidden and never takes the focus: shown, it went on to be covered — macOS
+    // then says it's hidden, and the page stops drawing for the rest of the run)
+    if (!shotsDir) { win.show(); win.focus(); }
+    if (miniWin) { miniWin.webContents.send('mini-state', { hidden: true }); miniWin.hide(); }
+  }
+  persistSettings();
+});
+// Main window → mini player: the state to show. Mini player → main window: what the user pressed.
+ipcMain.on('mini:state', (_e, s) => { if (miniWin && !miniWin.isDestroyed()) miniWin.webContents.send('mini-state', s); });
+ipcMain.on('mini:command', (_e, c) => { if (win) win.webContents.send('mini-command', c); });
+ipcMain.on('discord:track', (_e, track) => { if (!smokeDir) discord.setTrack(track); });
+
+// ---- Phone remote ------------------------------------------------------------------------------------------------
+// Settings → PHONE REMOTE, off unless turned on (and never in a smoke test): a small server on one home-network address
+// (remote.js) that a phone pairs with by the QR code. The phone's state and commands go by the player's page, as the
+// mini player's do. remote.json keeps { on, token, port, address }; the token never leaves main but inside the QR's
+// address, given to Settings. Its `address` is the preferred one — picked in Settings, or the first it was ever on —
+// which the remote goes back to whenever it's offered again.
+const os = require('os');
+const remoteNet = require('./remote-net');
+const remoteWiring = require('./remote-wiring');
+const remoteShelf = require('./remote-shelf');
+const { createRemote } = require('./remote');
+const REMOTE_WATCH_MS = 10000, REMOTE_REPLY_MS = 5000;
+let remoteConf = remoteWiring.readRemoteConf(store.readText(store.FILES.remote));
+let remote = null; // the server, while it runs
+let remoteAt = null; // { address, port } it runs on
+let remoteError = null; // on, but not running: 'network' (no home-network address to offer) or 'port' (refused)
+let remoteAddresses = []; // the addresses that could be offered, as last looked at
+let remoteWatch = null; // the address checked every 10 s, while on
+let remoteKept = { state: null, cover: null }; // the page's last full state for the phone, and the cover playing now
+let remoteSent = null; // the last whole state the phones were sent, but for where the song is (remote-wiring phoneEvent)
+let remotePhones = [];
+let remoteSeen = 0; // when a phone was last connected (the PC stays awake 30 minutes after)
+let remoteBlocker = null; // the powerSaveBlocker's id, while it keeps the PC awake
+let remoteWork = Promise.resolve(); // starts and stops, one at a time
+let phoneShelf = null; // { folder, data: a promise of the shelf's { albums, byKey } } for the phone, read from `folder`
+
+const saveRemoteConf = () => store.writeText(store.FILES.remote, JSON.stringify(remoteConf));
+const pageAlive = () => !!win && !win.isDestroyed() && !win.webContents.isCrashed();
+const toPage = (channel, ...args) => { if (pageAlive()) win.webContents.send(channel, ...args); };
+const remoteDo = (fn) => (remoteWork = remoteWork.then(fn).catch((e) => console.error(`Phone remote: ${e && e.message}`)));
+const lookAtAddresses = () => (remoteAddresses = remoteNet.pickAddresses(os.networkInterfaces()));
+
+function remoteStatus() {
+  const at = remote ? remoteAt : null;
+  return {
+    on: remoteConf.on,
+    url: at ? `http://${at.address}:${at.port}/pair?k=${remoteConf.token}` : null,
+    address: at ? at.address : null,
+    addresses: remoteAddresses,
+    port: at ? at.port : null,
+    phones: remotePhones,
+    error: remoteConf.on && !remote ? remoteError : null,
+  };
+}
+let sentRemoteStatus = null;
+function sendRemoteStatus() {
+  const status = remoteStatus(), text = JSON.stringify(status);
+  if (text === sentRemoteStatus) return;
+  sentRemoteStatus = text;
+  toPage('remote-status', status);
+}
+
+// The PC kept awake while the remote is on and a phone is connected or was in the last 30 minutes (a locked phone drops
+// its connection; playing music keeps the PC up anyway).
+function remoteKeepAwake() {
+  const want = remoteWiring.keepAwake({ on: remoteConf.on, phones: remotePhones.length, lastSeen: remoteSeen, now: Date.now() });
+  if (want && remoteBlocker === null) remoteBlocker = powerSaveBlocker.start('prevent-app-suspension');
+  else if (!want && remoteBlocker !== null) { powerSaveBlocker.stop(remoteBlocker); remoteBlocker = null; }
+}
+function phonesChanged(list) {
+  if (list.length || remotePhones.length) remoteSeen = Date.now();
+  remotePhones = list;
+  remoteKeepAwake();
+  sendRemoteStatus();
+}
+
+// The shelf as the phone sees it: read as the desktop shelf reads it, then kept while it's the same music folder and
+// nothing in it has changed (another folder picked: read again, so a key never plays the old folder's songs).
+function phoneShelfData() {
+  const folder = store.musicFolders().join('\n');
+  const kept = remoteWiring.shelfCacheFor(phoneShelf, folder);
+  if (kept) return kept;
+  const reading = shelfListing().then((r) => ({ albums: r.albums, byKey: remoteShelf.byKey(r.albums) }));
+  const entry = { folder, data: reading };
+  phoneShelf = entry;
+  reading.catch(() => { if (phoneShelf === entry) phoneShelf = null; });
+  return reading;
+}
+async function phoneCover(key) {
+  const album = (await phoneShelfData()).byKey.get(key);
+  if (!album || !album.tracks.length) return null;
+  // What's on this computer, or was found online before — the phone's scrolling never sends the web a search, nor
+  // pushes the desktop shelf's thumbnails out of their cache (the phone keeps its covers itself, for a day).
+  return remoteWiring.dataUrlBytes(await shelf.albumCover(album.tracks[0].path, { online: false, cached: true, keep: false }));
+}
+
+// The phone's commands go to the page, each answered by its id (none within 5 s: busy). An album's key is turned into
+// the shelf album here, paths and all; a key that names none any more is answered here.
+const pageReplies = remoteWiring.createReplies({
+  timeoutMs: REMOTE_REPLY_MS,
+  send: (id, cmd) => { if (!pageAlive()) return false; win.webContents.send('remote-command', { id, cmd }); return true; },
+});
+async function phoneCommand(cmd) {
+  if (cmd.action === 'album') {
+    const { byKey } = await phoneShelfData();
+    cmd = remoteWiring.albumCommand(cmd, byKey.get(cmd.value.id));
+    if (!cmd) return { error: 'gone' };
+  }
+  const result = await pageReplies.ask(cmd);
+  if (cmd.action === 'album') phoneShelf = null; // its NEW sticker off, its plays counted: the shelf read again next time
+  return result;
+}
+ipcMain.on('remote:reply', (e, id, result) => { if (win && e.sender === win.webContents) pageReplies.reply(id, result); });
+// The page's states: full ones (with `rev`) kept without their cover, which is kept apart for /cover/now; where the
+// song is, merged into the last full one. To the phones as they come: a whole state when it changed, else a tick of
+// where the song is (a few bytes, not the queue and the changer's covers once a second).
+ipcMain.on('remote:state', (e, s) => {
+  if (!remoteConf.on || !win || e.sender !== win.webContents) return;
+  const next = remoteWiring.nextRemoteState(remoteKept, s);
+  remoteKept = { state: next.state, cover: next.cover };
+  const out = remoteWiring.phoneEvent(next, remoteSent);
+  remoteSent = out.sent;
+  if (remote && out.event) remote.broadcast(out.data, out.event);
+});
+// The page gone (a crash): the phones get 503 until it's back and has sent a fresh state.
+function phonePageGone() {
+  remoteKept = { state: null, cover: null }; remoteSent = null;
+  pageReplies.failAll({ error: 'busy' });
+  if (remote) remote.setDown(true);
+}
+function phonePageBack() {
+  if (!remote) return;
+  remote.setDown(false);
+  toPage('remote-listening', true); // the page sends its full state at once
+}
+
+// The phone's page and the modules it uses, read as each server starts (only the names remote-wiring lists).
+const remotePageFiles = () => remoteWiring.pageFiles({ read: (rel) => fs.readFileSync(path.join(__dirname, '..', rel)), dict: () => i18n.current() });
+function newRemoteServer(address, port) {
+  return createRemote({
+    address, port, token: remoteConf.token, files: remotePageFiles(),
+    snapshot: () => remoteKept.state,
+    command: phoneCommand,
+    albums: async () => remoteShelf.phoneAlbums((await phoneShelfData()).albums, store.readShelfColors()),
+    album: async (key) => { const a = (await phoneShelfData()).byKey.get(key); return a ? remoteShelf.phoneAlbum(a) : null; },
+    coverFor: phoneCover,
+    nowCover: () => remoteKept.cover,
+    discPhoto: async (forCover) => { // (the same lookup, and the same kept photos, as the player's own disc)
+      const now = remoteKept.state && remoteKept.state.track;
+      return now && now.print && now.coverKey && now.coverKey === forCover ? remoteWiring.dataUrlBytes(await lookupDiscArt(now.print)) : null;
+    },
+    unpairedPage: () => remoteWiring.unpairedPage(),
+    onPhones: phonesChanged,
+    log: (text) => console.error(text),
+  });
+}
+// On the preferred address while it's offered, else the first offered (which becomes the preferred one only when there
+// was none: a moment without the Wi-Fi never makes another network the one it stays on); on the port kept, or one the
+// system picks when that's taken — then kept.
+async function startRemote() {
+  if (remote || !remoteConf.on || smokeDir) return;
+  const list = lookAtAddresses();
+  const address = remoteNet.addressToUse(remoteConf.address, null, list);
+  if (!address) { remoteError = 'network'; return; }
+  let server = newRemoteServer(address, remoteConf.port), port;
+  try {
+    ({ port } = await server.start());
+  } catch (e) {
+    if (e.code !== 'EADDRINUSE') { remoteError = e.code === 'EADDRNOTAVAIL' ? 'network' : 'port'; console.error(`Phone remote: ${e.message}`); return; }
+    server = newRemoteServer(address, 0);
+    try { ({ port } = await server.start()); } catch (e2) { remoteError = 'port'; console.error(`Phone remote: ${e2.message}`); return; }
+  }
+  remote = server; remoteAt = { address, port }; remoteError = null;
+  remoteConf = { ...remoteConf, address: remoteConf.address || address, port };
+  saveRemoteConf();
+  toPage('remote-listening', true);
+}
+// `quiet`: the phones aren't told it closed — they try again, and find they must scan the new code (NEW CODE, a new
+// address). Otherwise they're told why: 'off' or 'quit'.
+async function stopRemote(reason, { quiet = false } = {}) {
+  const server = remote;
+  remote = null; remoteAt = null;
+  if (!server) return;
+  if (quiet) server.disconnectAll();
+  await server.stop(reason);
+}
+function watchRemote() {
+  remoteDo(async () => {
+    if (!remoteConf.on) return;
+    // Running, but on another address than it should be now (the one it's on gone; the preferred one back): moved.
+    // Not running with an address offered (the network back, a port refused before): tried again.
+    const list = lookAtAddresses();
+    const want = remote ? remoteNet.addressToUse(remoteConf.address, remoteAt.address, list) : null;
+    if (want && want !== remoteAt.address) {
+      await stopRemote('off', { quiet: true });
+      await startRemote();
+    } else if (!remote && list.length) {
+      await startRemote();
+    }
+    remoteKeepAwake();
+    sendRemoteStatus();
+  });
+}
+async function turnRemoteOn() {
+  if (smokeDir) return;
+  if (!remoteConf.on || !remoteConf.token) {
+    remoteConf = { ...remoteConf, on: true, token: remoteConf.token || remoteNet.newToken() };
+    saveRemoteConf();
+  }
+  if (!remoteWatch) remoteWatch = setInterval(watchRemote, REMOTE_WATCH_MS);
+  await startRemote();
+  remoteKeepAwake();
+  sendRemoteStatus();
+}
+async function turnRemoteOff() {
+  if (remoteConf.on) { remoteConf = { ...remoteConf, on: false }; saveRemoteConf(); }
+  clearInterval(remoteWatch); remoteWatch = null;
+  await stopRemote('off');
+  remoteKept = { state: null, cover: null }; remoteSent = null; remoteError = null; remotePhones = [];
+  remoteSeen = 0; // on again soon after, the PC isn't kept awake for a phone that was here before
+  toPage('remote-listening', false);
+  remoteKeepAwake();
+  sendRemoteStatus();
+}
+handle('remote:status', () => { lookAtAddresses(); return remoteStatus(); });
+handle('remote:set', (on) => remoteDo(() => (on === true ? turnRemoteOn() : turnRemoteOff())).then(remoteStatus));
+// Another of the offered addresses, picked in Settings (the phones scan the code again).
+handle('remote:address', (address) => remoteDo(async () => {
+  if (!lookAtAddresses().some((e) => e.address === address)) return;
+  remoteConf = { ...remoteConf, address };
+  saveRemoteConf();
+  if (remote && remoteAt.address !== address) { await stopRemote('off', { quiet: true }); await startRemote(); }
+  sendRemoteStatus();
+}).then(remoteStatus));
+// NEW CODE: a new token, and a new server with it — every phone's cookie stops working, so each must scan again.
+handle('remote:newCode', () => remoteDo(async () => {
+  remoteConf = { ...remoteConf, token: remoteNet.newToken() };
+  saveRemoteConf();
+  if (remote) { await stopRemote('off', { quiet: true }); await startRemote(); }
+  sendRemoteStatus();
+}).then(remoteStatus));
+handle('win:toggleFullscreen', () => { if (win && !miniMode) win.setFullScreen(!win.isFullScreen()); });
+handle('win:isFullscreen', () => !!(win && win.isFullScreen()));
+// Whether the window is put together without the graphics card (gpu-status.js) — asked once, and told again whenever
+// Chromium's view of the card changes (the graphics process falling back to software after crashes, say).
+const softwareRendering = () => require('./gpu-status').softwareCompositing(app.getGPUFeatureStatus());
+handle('gpu:software', () => softwareRendering());
+app.on('gpu-info-update', () => { if (win && !win.isDestroyed()) win.webContents.send('gpu-software', softwareRendering()); });
+// The newest release the last check found (with this system's file), and its download once one has started.
+let latestUpdate = null;
+let updateDownload = null; // { version, plan, promise → file }
+handle('updates:check', async () => {
+  if (smokeDir) return null;
+  const update = await updates.checkForUpdate(APP_VERSION);
+  if (update && update.offline) return update;
+  latestUpdate = update;
+  return update && { version: update.version, canDownload: !!update.asset };
+});
+handle('updates:openReleases', () => shell.openExternal(updates.RELEASES_PAGE));
+// Downloads the latest release's file (once — asking again while it's coming or done gets the same one). Progress goes
+// to the window as 'update-progress' (0…1). → { version, install: 'replace' | 'open' }.
+handle('updates:download', async () => {
+  const update = latestUpdate;
+  if (!update || !update.asset) throw new Error('no update to download');
+  if (!updateDownload || updateDownload.version !== update.version) {
+    const plan = app.isPackaged ? updates.installPlan() : { kind: 'open' }; // never swap out node_modules' Electron
+    const promise = updates.downloadAsset(update.asset, updates.downloadDir(plan, app.getPath('downloads')),
+      (fraction) => { if (win) win.webContents.send('update-progress', fraction); });
+    updateDownload = { version: update.version, plan, promise };
+    promise.catch(() => { if (updateDownload && updateDownload.promise === promise) updateDownload = null; });
+  }
+  await updateDownload.promise;
+  return { version: updateDownload.version, install: updateDownload.plan.kind };
+});
+// Puts the downloaded release in place and restarts into it — or, where this copy can't be replaced, opens the disk
+// image (macOS) or shows the file (Windows, Linux) for the person to take from there.
+handle('updates:install', async () => {
+  if (!updateDownload) return false;
+  const { plan, promise } = updateDownload;
+  const file = await promise;
+  if (plan.kind === 'replace' && await updates.startInstaller(process.platform, { pid: process.pid, file, target: plan.target })) {
+    app.quit();
+    return true;
+  }
+  if (process.platform === 'darwin') await shell.openPath(file);
+  else shell.showItemInFolder(file);
+  return plan.kind !== 'replace'; // false: it was to be swapped in, but the installer couldn't be started
+});
+// Text for the user to paste elsewhere (the Spotify dashboard's Redirect URI). Only short plain text.
+handle('clipboard:write', async (text) => { if (typeof text === 'string' && text.length <= 20000) await clipboard.writeText(text); return true; });
+handle('shell:openGitHub', (user) => { if (/^[A-Za-z0-9-]+$/.test(user)) shell.openExternal(`https://github.com/${user}`); });
+
+// ---- Audio CDs ---------------------------------------------------------------------------------------------------
+// Every few seconds: which audio CDs are in a drive. A new one is named from MusicBrainz (in the background) and the
+// window hears about it — first as it is, then again once it has names; a disc that's gone is reported gone.
+
+const discs = new Map(); // mount -> { disc, named, naming }
+const discMessage = ({ disc, named, naming }) => ({
+  mount: disc.mount, id: disc.id, tracks: disc.tracks, name: disc.name,
+  album: named ? named.album : null, artist: named ? named.artist : null, year: named ? named.year : null,
+  ready: !naming, // MusicBrainz has answered (or couldn't): ripping now uses the names
+});
+let polling = false;
+async function pollDiscs() {
+  if (polling) return; // the last check is still going (a slow drive): skip this one rather than queue behind it
+  polling = true;
+  try { await checkDiscs(); } finally { polling = false; }
+}
+async function checkDiscs() {
+  const now = await audioCd.findDiscs().catch(() => []);
+  const seen = new Set(now.map((d) => d.mount));
+  for (const [mount, entry] of discs) {
+    if (seen.has(mount) && entry.disc.id === (now.find((d) => d.mount === mount) || {}).id) continue;
+    discs.delete(mount);
+    audioCd.forgetDisc(entry.disc);
+    if (ripping && ripping.mount === mount) { ripping.gone = true; ripping.controller.abort(); } // taken out mid-rip
+    if (win) win.webContents.send('audio-cd-gone', { mount, tracks: entry.disc.tracks });
+  }
+  for (const disc of now) {
+    if (discs.has(disc.mount)) continue;
+    const entry = { disc, named: null, naming: true };
+    discs.set(disc.mount, entry);
+    if (win) win.webContents.send('audio-cd', discMessage(entry));
+    audioCd.nameDisc(disc, {
+      isCurrent: () => discs.get(disc.mount) === entry,
+      fetchMb: online.mbFetch,
+      fetchCover: (releaseId) => online.coverFromUrl(`https://coverartarchive.org/release/${releaseId}/front-500`),
+    }).then((named) => {
+      if (!named || discs.get(disc.mount) !== entry) return;
+      entry.named = named;
+      for (const p of disc.tracks) metadata.forget(p);
+    }).catch(() => {}).finally(() => {
+      if (discs.get(disc.mount) !== entry) return;
+      entry.naming = false;
+      if (win) win.webContents.send('audio-cd', discMessage(entry));
+    });
+  }
+}
+handle('cd:list', () => [...discs.values()].map(discMessage));
+// The real drive's eject, for when the tray is opened on a CD that's in it.
+handle('cd:eject', (mount) => {
+  if (!discs.has(mount)) return false;
+  if (process.platform === 'darwin') execFile('diskutil', ['eject', mount], () => {});
+  else if (process.platform === 'linux') execFile('gio', ['mount', '-e', mount], () => {});
+  else if (process.platform === 'win32') require('./win-cd').eject(mount).catch(() => {});
+  return true;
+});
+
+// ---- Ripping ------------------------------------------------------------------------------------------------------
+// RIP: the disc in the drive saved into the music folder as FLAC, MP3 or WAV (Settings → RIP FORMAT; rip.js). One rip
+// at a time; taking the disc out, or RIP clicked again, stops it.
+let ripping = null; // { mount, controller, done }
+handle('rip:start', async (mount, format) => {
+  const entry = discs.get(mount);
+  format = ['FLAC', 'MP3', 'WAV'].includes(format) ? format : 'FLAC';
+  if (!entry || ripping) return { ok: false, reason: 'busy' };
+  if (entry.naming) return { ok: false, reason: 'naming' }; // (the button waits for this too)
+  let musicFolder = store.musicFolders()[0]; // (several: into the first)
+  if (!musicFolder) {
+    const r = await dialog.showOpenDialog(win, { title: t('Your Music Folder'), defaultPath: dialogDefaultPath(), properties: ['openDirectory', 'createDirectory'] });
+    if (r.canceled || !r.filePaths.length) return { ok: false, reason: 'cancelled' };
+    musicFolder = r.filePaths[0];
+    store.writeMusicFolders([musicFolder, ...store.readMusicFolders()]);
+    store.writeLastPath(musicFolder);
+  }
+  const { disc, named } = entry;
+  const first = audioCd.detailsFor(disc.tracks[0]) || {};
+  const album = {
+    album: named ? named.album : null, albumArtist: first.albumArtist || (named && named.artist) || null, artist: named ? named.artist : null,
+    year: named ? named.year : null, releaseId: first.releaseId || null, cover: first.cover || null, discId: disc.id,
+  };
+  const tracks = disc.tracks.map((p, i) => {
+    const d = audioCd.detailsFor(p) || {};
+    return { path: p, title: d.title || null, artist: d.artist || null, number: d.track || i + 1, disc: d.disc || 1, discs: d.discs || 1 };
+  });
+  // Asked only when this rip's own files are there — disc 2 of a set shares disc 1's folder without replacing it.
+  const folder = rip.albumFolder(musicFolder, album), already = rip.existingTargets(musicFolder, album, tracks, format);
+  if (already.length) {
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'question', buttons: [t('Replace'), t('Cancel')], defaultId: 1, cancelId: 1,
+      message: album.album ? t('{album} is already in your music folder.', { album: album.album }) : t('This disc is already in your music folder.'),
+      detail: already.length === 1 ? t('Replace its track in {folder} with this rip?', { folder }) : t('Replace its {n} tracks in {folder} with this rip?', { n: already.length, folder }),
+    });
+    if (response !== 0) return { ok: false, reason: 'cancelled' };
+  }
+  const controller = new AbortController(), current = { mount, controller, gone: false };
+  ripping = current;
+  libraryWatch.hold(true); // the shelf reads the album once it's all there, not after each track
+  lastRipKept = [];
+  const run = rip.ripDisc({
+    tracks, album, musicFolder, format, signal: controller.signal,
+    onProgress: (p) => { if (win) win.webContents.send('rip-progress', { ...p, folder }); },
+  });
+  current.done = run.catch(() => {});
+  try {
+    const result = await run;
+    lastRipFolder = result.folder;
+    return { ok: true, folder: result.folder, album: album.album };
+  } catch (e) {
+    const reason = current.gone ? 'disc-removed' : e.reason || 'failed';
+    lastRipKept = e.files || [];
+    return { ok: false, reason, message: reason === 'failed' ? e.message : null, kept: lastRipKept.length };
+  } finally { ripping = null; libraryWatch.hold(false); }
+});
+handle('rip:cancel', () => { if (ripping) ripping.controller.abort(); return true; });
+// The rip panel's SHOW IN FOLDER: the folder the last rip wrote (and nothing else).
+let lastRipFolder = null;
+handle('rip:showFolder', () => (lastRipFolder ? shell.openPath(lastRipFolder) : null));
+// A rip stopped part-way keeps the tracks it finished; the panel's DELETE THE n RIPPED takes them away again — those
+// files only, then the album's folder if nothing else is left in it (its cover.jpg aside).
+let lastRipKept = [];
+handle('rip:deleteKept', async () => {
+  const files = lastRipKept;
+  lastRipKept = [];
+  for (const f of files) await fs.promises.rm(f, { force: true }).catch(() => {});
+  const folder = files.length ? path.dirname(files[0]) : null;
+  if (folder) {
+    const left = await fs.promises.readdir(folder).catch(() => null);
+    if (left && left.every((n) => n === 'cover.jpg' || n.startsWith('.'))) await fs.promises.rm(folder, { recursive: true, force: true }).catch(() => {});
+  }
+  return files.length;
+});
+
+// ---- TAKE ALONG -------------------------------------------------------------------------------------------------
+// Albums copied (or made MP3) onto a portable player, a phone, an SD card (take-along.js). Where to and how are
+// remembered in take-along.json in the data folder. One at a time; CANCEL stops it, leaving no half files.
+const takeAlongLib = require('./take-along');
+const TAKE_ALONG_FILE = 'take-along.json';
+function takeAlongSettings() {
+  try { const s = JSON.parse(store.readText(TAKE_ALONG_FILE) || ''); return { dest: typeof s.dest === 'string' ? s.dest : null, format: takeAlongLib.FORMATS.includes(s.format) ? s.format : 'COPY' }; } catch { return { dest: null, format: 'COPY' }; }
+}
+const saveTakeAlong = (changes) => store.writeText(TAKE_ALONG_FILE, JSON.stringify({ ...takeAlongSettings(), ...changes }));
+// What's chosen ({ all: true } — every album on the shelf — or { paths }: the songs of the albums shown, the changer's
+// discs, one album) as the shelf's albums, each with only the songs chosen; songs not on the shelf grouped by their tags.
+async function takeAlongAlbums(what) {
+  const { albums } = await shelf.scanAlbums(() => {});
+  if (what && what.all) return albums;
+  const wanted = new Set(Array.isArray(what && what.paths) ? what.paths.filter((p) => typeof p === 'string') : []);
+  const out = [], onShelf = new Set();
+  for (const a of albums) {
+    const tracks = a.tracks.filter((tr) => wanted.has(tr.path));
+    tracks.forEach((tr) => onShelf.add(tr.path));
+    if (tracks.length) out.push({ ...a, tracks });
+  }
+  const rest = [...wanted].filter((p) => !onShelf.has(p) && !/^[a-z]+:\/\//i.test(p) && cue.entryExists(p));
+  const infos = [];
+  for (const p of rest) { try { infos.push({ path: p, info: await shelf.trackInfo(p) }); } catch { /* unreadable: left out */ } }
+  return [...out, ...shelf.groupAlbums(infos)];
+}
+handle('takeAlong:settings', () => { const s = takeAlongSettings(); return { ...s, there: !!s.dest && store.isDir(s.dest), name: s.dest ? path.basename(s.dest) || s.dest : null }; });
+handle('takeAlong:pickFolder', async () => {
+  const s = takeAlongSettings();
+  const r = await dialog.showOpenDialog(win, { title: t('Take Along To'), defaultPath: s.dest && store.isDir(s.dest) ? s.dest : dialogDefaultPath(), properties: ['openDirectory', 'createDirectory'] });
+  if (r.canceled || !r.filePaths.length) return null;
+  saveTakeAlong({ dest: r.filePaths[0] });
+  return r.filePaths[0];
+});
+handle('takeAlong:setFormat', (format) => { if (takeAlongLib.FORMATS.includes(format)) saveTakeAlong({ format }); });
+handle('takeAlong:plan', async (what) => {
+  const s = takeAlongSettings();
+  return takeAlongLib.plan(await takeAlongAlbums(what), { dest: s.dest && store.isDir(s.dest) ? s.dest : null, format: s.format });
+});
+let takingAlong = null; // its AbortController
+handle('takeAlong:start', async (what) => {
+  if (takingAlong) return { ok: false, reason: 'busy' };
+  const s = takeAlongSettings();
+  if (!s.dest || !store.isDir(s.dest)) return { ok: false, reason: 'gone' };
+  const controller = takingAlong = new AbortController();
+  try {
+    const albums = await takeAlongAlbums(what);
+    const r = await takeAlongLib.takeAlong({
+      albums, dest: s.dest, format: s.format, signal: controller.signal,
+      coverFor: (a) => (a.tracks[0] ? shelf.albumCoverFull(a.tracks[0].path) : null),
+      onProgress: (p) => { if (win && !win.isDestroyed()) win.webContents.send('take-along-progress', p); },
+    });
+    return { ok: true, ...r, failed: r.failed.length, dest: s.dest };
+  } catch (e) {
+    return { ok: false, reason: e.reason || 'failed', message: e.reason ? null : e.message, need: e.need || null, free: e.free || null };
+  } finally { takingAlong = null; }
+});
+handle('takeAlong:cancel', () => { if (takingAlong) takingAlong.abort(); return true; });
+handle('takeAlong:showFolder', () => { const s = takeAlongSettings(); return s.dest && store.isDir(s.dest) ? shell.openPath(s.dest) : null; });
+
+// ---- Windows Start menu shortcut ----------------------------------------------------------------------------------
+// Without a Start menu shortcut carrying the app's ID, Windows can't tell whose media session it is and shows
+// "Unknown app" in its media controls. The portable .exe installs nothing, so the app keeps this one shortcut up to
+// date itself — which also makes taskbar pins launch the real .exe, not the temporary copy it runs from.
+function registerWindowsShortcut() {
+  if (process.platform !== 'win32' || !app.isPackaged || smokeDir || process.env.CDPLAYER_HOME) return;
+  const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+  const link = path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'CDPlayer.lnk');
+  try {
+    const existing = fs.existsSync(link) ? shell.readShortcutLink(link) : null;
+    if (existing && existing.target === exe && existing.appUserModelId === APP_ID) return;
+    shell.writeShortcutLink(link, existing ? 'replace' : 'create', {
+      target: exe, cwd: path.dirname(exe), appUserModelId: APP_ID, icon: exe, iconIndex: 0, description: 'CDPlayer',
+    });
+  } catch { /* best effort — only the media controls' app name depends on it */ }
+}
+// Per-disc taskbar IDs earlier builds left in the registry (see win-taskbar-disc.js).
+function cleanUpTaskbarIds() {
+  if (taskbarDisc) taskbarDisc.cleanUp().catch(() => {});
+}
+
+// ---- Lifecycle --------------------------------------------------------------------------------------------------
+
+app.whenReady().then(() => {
+  if (compareArg) { runThemeCompare(); return; }
+  // First launch only: the system's light/dark picks WHITE or RED (read before the window exists).
+  const first = smokeDir || shotsDir ? null : initialTheme({ hasSettings: hadSettings, systemDark: nativeTheme.shouldUseDarkColors });
+  if (first) { settings = { ...settings, theme: first }; persistSettings(); }
+  // A theme of your own named like a built-in one added since (WHITE) gets a name of its own, and stays the one shown.
+  const renamed = userThemes.freeBuiltinNames();
+  if (renamed[settings.theme]) { settings = { ...settings, theme: renamed[settings.theme] }; persistSettings(); }
+  nativeTheme.themeSource = startupTheme.lightPalette(settings.theme, userThemes.list()) ? 'light' : 'dark';
+  i18n.loadLocale(settings.language, app.getPreferredSystemLanguages());
+  protocol.handle('cdp', media.handle);
+  registerWindowsShortcut();
+  cleanUpTaskbarIds();
+  buildMenu();
+  createWindow();
+  watchMusicFolder(); // (also, the first time, makes the old music folder the list — before any dialog can move it)
+  setTimeout(dailyBackup, 60e3);
+  setInterval(dailyBackup, 4 * 3600e3);
+  if (remoteConf.on && !smokeDir && gotLock) remoteDo(turnRemoteOn); // (a second launch, handing over to the first, never)
+  if (!smokeDir && (process.platform === 'darwin' || process.platform === 'linux' || process.platform === 'win32' || process.env.CDPLAYER_CD_ROOT)) {
+    setTimeout(pollDiscs, 1500);
+    setInterval(pollDiscs, 3000);
+  }
+  app.on('activate', () => {
+    if (!win) createWindow();
+    else if (miniMode && miniWin) miniWin.show();
+    else win.show();
+  });
+});
+let restoredRate = false;
+let ripStopped = false;
+app.on('before-quit', (e) => {
+  // Quitting while a CD rips: asked first; then the rip is stopped properly (no half-written file left) before quitting.
+  if (ripping && !ripStopped) {
+    e.preventDefault();
+    const choice = dialog.showMessageBoxSync(...(win && !win.isDestroyed() ? [win] : []), {
+      type: 'question', buttons: [t('Stop Ripping and Quit'), t('Keep Ripping')], defaultId: 1, cancelId: 1,
+      message: t('A CD is being ripped.'), detail: t('The tracks already ripped are kept; the one being ripped is not.'),
+    });
+    if (choice !== 0) return;
+    ripStopped = true;
+    const { controller, done } = ripping;
+    controller.abort();
+    Promise.race([done, new Promise((r) => setTimeout(r, 5000))]).finally(() => app.quit());
+    return;
+  }
+  quitting = true;
+  if (playsTimer) { clearTimeout(playsTimer); writePlays(); }
+  libraryWatch.stop();
+  if (restoredRate || smokeDir || !gotLock) return;
+  if (!outputRate.pending()) { outputRate.restore({ final: true }).catch(() => {}); return; } // nothing to put back: quit now, and no more switching
+  e.preventDefault();
+  restoredRate = true;
+  // a helper call can take 5 s, so the cap is longer; the final restore also stops any later switch
+  Promise.race([outputRate.restore({ final: true }), new Promise((r) => setTimeout(r, 8000))]).catch(() => {}).finally(() => app.quit());
+});
+// The phones are told CDPlayer closed.
+app.on('will-quit', () => {
+  clearInterval(remoteWatch); remoteWatch = null;
+  if (remote) { remote.stop('quit'); remote = null; }
+});
+app.on('window-all-closed', () => app.quit());

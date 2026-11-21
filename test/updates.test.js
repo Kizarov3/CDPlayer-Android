@@ -1,0 +1,220 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdplayer-test-'));
+process.env.CDPLAYER_HOME = home; // never touch a real ~/.cdplayer
+const { execFileSync } = require('child_process');
+const crypto = require('crypto');
+const { checkForUpdate, isNewer, pickAsset, installPlan, downloadAsset, installScript } = require('../src/main/updates');
+
+test.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+const releasing = (version) => {
+  const calls = [];
+  const fetchLatest = async (current) => { calls.push(current); return version && { version, asset: null }; };
+  return { calls, fetchLatest };
+};
+const offline = async () => { throw new Error('offline'); };
+
+test('version comparison', () => {
+  assert.strictEqual(isNewer('2.2.0', '2.1.0'), true);
+  assert.strictEqual(isNewer('v2.10.0', '2.9.9'), true);
+  assert.strictEqual(isNewer('3.0.0', '2.99.99'), true);
+  assert.strictEqual(isNewer('2.1.0', '2.1.0'), false);
+  assert.strictEqual(isNewer('2.0.5', '2.1.0'), false);
+  assert.strictEqual(isNewer('2.2.0-beta', '2.1.0'), false);
+  assert.strictEqual(isNewer('', '2.1.0'), false);
+});
+
+test('reports a newer release, and not the one already running', async () => {
+  assert.deepStrictEqual(await checkForUpdate('2.1.0', releasing('2.2.0')), { version: '2.2.0', asset: null });
+  assert.strictEqual(await checkForUpdate('2.2.0', releasing('2.2.0')), null);
+  assert.strictEqual(await checkForUpdate('2.3.0', releasing('2.2.0')), null);
+  assert.strictEqual(await checkForUpdate('2.1.0', releasing(null)), null);
+});
+
+test('every check asks GitHub, so the newest release is always the one announced', async () => {
+  // 2.3.0 and 2.3.1 came out an hour apart; a saved answer kept showing "2.3.0 AVAILABLE" to someone on 2.2.0.
+  const first = releasing('2.3.0');
+  assert.deepStrictEqual(await checkForUpdate('2.2.0', first), { version: '2.3.0', asset: null });
+  const next = releasing('2.3.1');
+  assert.deepStrictEqual(await checkForUpdate('2.2.0', next), { version: '2.3.1', asset: null });
+  assert.strictEqual(first.calls.length, 1);
+  assert.strictEqual(next.calls.length, 1);
+});
+
+test('nothing is saved between checks', async () => {
+  await checkForUpdate('2.1.0', releasing('2.2.0'));
+  assert.deepStrictEqual(fs.readdirSync(home), []);
+  // Offline right after a check that found 2.2.0: no remembered answer to fall back on.
+  assert.deepStrictEqual(await checkForUpdate('2.1.0', { fetchLatest: offline }), { offline: true });
+});
+
+const ASSETS = [
+  { name: 'CDPlayer-2.13.0-mac.dmg', size: 10, browser_download_url: 'https://x/mac', digest: `sha256:${'a'.repeat(64)}` },
+  { name: 'CDPlayer-2.13.0-windows.exe', size: 20, browser_download_url: 'https://x/win' },
+  { name: 'CDPlayer-2.13.0-linux.AppImage', size: 30, browser_download_url: 'https://x/linux' },
+];
+
+test('each system gets its own file from the release', () => {
+  assert.deepStrictEqual(pickAsset(ASSETS, 'darwin'), { name: 'CDPlayer-2.13.0-mac.dmg', url: 'https://x/mac', size: 10, sha256: 'a'.repeat(64) });
+  assert.strictEqual(pickAsset(ASSETS, 'win32').url, 'https://x/win');
+  assert.strictEqual(pickAsset(ASSETS, 'win32').sha256, null);
+  assert.strictEqual(pickAsset(ASSETS, 'linux').url, 'https://x/linux');
+  assert.strictEqual(pickAsset(ASSETS, 'freebsd'), null);
+  assert.strictEqual(pickAsset([], 'darwin'), null);
+});
+
+test('the app is replaced in place only where it can be', () => {
+  const yes = () => true, no = () => false;
+  const mac = (execPath, canWrite = yes) => installPlan({ platform: 'darwin', execPath, env: {}, canWrite });
+  assert.deepStrictEqual(mac('/Applications/CDPlayer.app/Contents/MacOS/CDPlayer'), { kind: 'replace', target: '/Applications/CDPlayer.app' });
+  assert.deepStrictEqual(mac('/Volumes/CDPlayer 2.12.0/CDPlayer.app/Contents/MacOS/CDPlayer'), { kind: 'open' }); // run from the disk image
+  assert.deepStrictEqual(mac('/private/var/folders/x/T/AppTranslocation/1/d/CDPlayer.app/Contents/MacOS/CDPlayer'), { kind: 'open' });
+  assert.deepStrictEqual(mac('/Applications/CDPlayer.app/Contents/MacOS/CDPlayer', no), { kind: 'open' }); // no write access
+  assert.deepStrictEqual(mac('/usr/local/bin/electron'), { kind: 'open' });
+  const win = installPlan({ platform: 'win32', execPath: 'C:\\T\\x\\CDPlayer.exe', env: { PORTABLE_EXECUTABLE_FILE: 'C:\\Apps\\CDPlayer.exe' }, canWrite: yes });
+  assert.deepStrictEqual(win, { kind: 'replace', target: 'C:\\Apps\\CDPlayer.exe' });
+  assert.deepStrictEqual(installPlan({ platform: 'win32', execPath: 'C:\\x\\CDPlayer.exe', env: {}, canWrite: yes }), { kind: 'open' }); // win-unpacked
+  assert.deepStrictEqual(installPlan({ platform: 'linux', execPath: '/tmp/.mount/cdplayer', env: { APPIMAGE: '/home/a/CDPlayer.AppImage' }, canWrite: yes }), { kind: 'replace', target: '/home/a/CDPlayer.AppImage' });
+  assert.deepStrictEqual(installPlan({ platform: 'linux', execPath: '/opt/CDPlayer/cdplayer', env: {}, canWrite: yes }), { kind: 'open' }); // AUR package
+});
+
+const serving = (bytes) => async () => new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+
+test('a download arrives whole, checked, under its own name', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdplayer-dl-'));
+  try {
+    const bytes = Buffer.from('the new CDPlayer');
+    const seen = [];
+    const file = await downloadAsset({ name: 'CDPlayer-2.13.0-mac.dmg', url: 'u', size: bytes.length, sha256: sha(bytes) }, dir, (f) => seen.push(f), { fetchImpl: serving(bytes) });
+    assert.strictEqual(file, path.join(dir, 'CDPlayer-2.13.0-mac.dmg'));
+    assert.deepStrictEqual(fs.readFileSync(file), bytes);
+    assert.strictEqual(seen.at(-1), 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a short or altered download is refused and leaves nothing behind', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdplayer-dl-'));
+  try {
+    const bytes = Buffer.from('the new CDPlayer');
+    await assert.rejects(downloadAsset({ name: 'a.dmg', url: 'u', size: bytes.length + 5, sha256: null }, dir, undefined, { fetchImpl: serving(bytes) }));
+    await assert.rejects(downloadAsset({ name: 'a.dmg', url: 'u', size: bytes.length, sha256: 'b'.repeat(64) }, dir, undefined, { fetchImpl: serving(bytes) }));
+    await assert.rejects(downloadAsset({ name: 'a.dmg', url: 'u', size: 1, sha256: null }, dir, undefined, { fetchImpl: async () => new Response('gone', { status: 404 }) }));
+    assert.deepStrictEqual(fs.readdirSync(dir), []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the install scripts quote paths with spaces and quotes', () => {
+  const paths = { pid: 42, file: "/tmp/it's here/CDPlayer.dmg", target: "/Users/o'neil/Apps/CDPlayer.app" };
+  const mac = installScript('darwin', paths).text;
+  assert.match(mac, /kill -0 42/);
+  assert.ok(mac.includes(`'/Users/o'\\''neil/Apps/CDPlayer.app'`));
+  const win = installScript('win32', { pid: 42, file: "C:\\Temp\\it's\\CDPlayer.exe", target: 'C:\\My Apps\\CDPlayer.exe' }).text;
+  assert.ok(win.includes(`'C:\\Temp\\it''s\\CDPlayer.exe'`));
+  assert.ok(win.includes(`-Destination 'C:\\My Apps\\CDPlayer.exe'`));
+});
+
+test('the AppImage script swaps the file once the old app has quit, and starts the new one', { skip: process.platform === 'win32' }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdplayer-swap-'));
+  try {
+    const target = path.join(dir, "My Apps", "CDPlayer.AppImage");
+    fs.mkdirSync(path.dirname(target));
+    fs.writeFileSync(target, '#!/bin/sh\necho old > "$0.ran"\n', { mode: 0o755 });
+    const file = path.join(dir, 'CDPlayer-2.13.0-linux.AppImage');
+    fs.writeFileSync(file, `#!/bin/sh\necho new > '${target}.ran'\n`);
+    const gone = execFileSync('/bin/sh', ['-c', 'sh -c "exit 0" & echo $!']).toString().trim(); // a pid that has exited
+    const script = path.join(dir, 'install.sh');
+    fs.writeFileSync(script, installScript('linux', { pid: gone, file, target }).text);
+    execFileSync('/bin/sh', [script]);
+    for (let i = 0; i < 50 && !fs.existsSync(`${target}.ran`); i++) execFileSync('sleep', ['0.1']);
+    assert.match(fs.readFileSync(target, 'utf8'), /echo new/);
+    assert.strictEqual(fs.readFileSync(`${target}.ran`, 'utf8'), 'new\n');
+    assert.ok(!fs.existsSync(file));
+    assert.ok(!fs.existsSync(script)); // the script cleans up after itself
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Windows: the installer is started by WMI, so it outlives CDPlayer, and CDPlayer waits for that before quitting', async () => {
+  const { startInstaller, wmiStartCommand } = require('../src/main/updates');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdplayer-inst-'));
+  try {
+    const file = path.join(dir, 'CDPlayer-2.13.0-windows.exe');
+    const calls = [], started = [];
+    const run = (cmd, args, opts, cb) => { calls.push([cmd, args]); setTimeout(() => cb(null), 10); };
+    const start = (...a) => { started.push(a); return { unref() {} }; };
+    let done = false;
+    const p = startInstaller('win32', { pid: 7, file, target: 'C:\\My Apps\\CDPlayer.exe' }, { run, start }).then(() => { done = true; });
+    assert.strictEqual(done, false); // not before WMI has answered
+    await p;
+    assert.ok(fs.existsSync(path.join(dir, 'install.ps1')));
+    assert.match(calls[0][0], /^[A-Z]:\\Windows\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe$/i); // by its full path
+    assert.match(calls[0][1].at(-1), /CommandLine = '[A-Z]:\\Windows\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe /i);
+    const command = calls[0][1].at(-1);
+    assert.match(command, /Invoke-CimMethod -ClassName Win32_Process -MethodName Create/);
+    assert.ok(command.includes(`-File ${path.join(dir, 'install.ps1')}`) || command.includes(`-File "${path.join(dir, 'install.ps1')}"`));
+    assert.deepStrictEqual(started, []); // WMI started it: no ordinary child
+    assert.match(wmiStartCommand("a 'quoted' path"), /CommandLine = 'a ''quoted'' path'/);
+
+    // WMI failing: the ordinary way, as a last resort
+    const failing = (cmd, args, opts, cb) => cb(new Error('no WMI'));
+    assert.strictEqual(await startInstaller('win32', { pid: 7, file, target: 'C:\\x.exe' }, { run: failing, start }), true);
+    assert.strictEqual(started.length, 1);
+    assert.match(started[0][0], /\\powershell\.exe$/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the installer is started in the download\'s folder, and one that can\'t be started says so instead of bringing CDPlayer down', async () => {
+  const { EventEmitter } = require('events');
+  const { startInstaller } = require('../src/main/updates');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdplayer-inst-'));
+  try {
+    const file = path.join(dir, 'CDPlayer-2.23.0-windows.exe');
+    const opts = [];
+    // As SYSTEM the folder CDPlayer was started in can't be seen by it: WMI's PowerShell and the ordinary one both fail.
+    const noWmi = (cmd, args, o, cb) => { opts.push(o); cb(Object.assign(new Error('spawn powershell.exe ENOENT'), { code: 'ENOENT' })); };
+    const failsToSpawn = (cmd, args, o) => {
+      opts.push(o);
+      const child = Object.assign(new EventEmitter(), { unref() {} });
+      setImmediate(() => child.emit('error', Object.assign(new Error('spawn powershell.exe ENOENT'), { code: 'ENOENT' })));
+      return child;
+    };
+    assert.strictEqual(await startInstaller('win32', { pid: 7, file, target: 'C:\\x.exe' }, { run: noWmi, start: failsToSpawn }), false);
+    assert.deepStrictEqual(opts.map((o) => o.cwd), [dir, dir]);
+    const throws = () => { throw new Error('EACCES'); };
+    assert.strictEqual(await startInstaller('darwin', { pid: 7, file: path.join(dir, 'CDPlayer.dmg'), target: '/Applications/CDPlayer.app' }, { start: throws }), false);
+    const spawns = (cmd, args, o) => { const c = Object.assign(new EventEmitter(), { unref() {} }); setImmediate(() => c.emit('spawn')); assert.strictEqual(o.cwd, dir); return c; };
+    assert.strictEqual(await startInstaller('linux', { pid: 7, file: path.join(dir, 'CDPlayer.AppImage'), target: '/home/a/CDPlayer.AppImage' }, { start: spawns }), true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a download that goes quiet is given up, connecting or mid-way, and leaves nothing behind', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdplayer-dl-'));
+  try {
+    const asset = { name: 'a.dmg', url: 'u', size: 100, sha256: null };
+    // Some bytes, then nothing more, ever.
+    const stalls = async () => new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(10)); } }));
+    await assert.rejects(downloadAsset(asset, dir, undefined, { fetchImpl: stalls, stallMs: 100 }), /stalled/);
+    // No answer at all.
+    const hangs = (_u, { signal }) => new Promise((_res, rej) => signal.addEventListener('abort', () => rej(signal.reason)));
+    await assert.rejects(downloadAsset(asset, dir, undefined, { fetchImpl: hangs, stallMs: 100 }), /stalled/);
+    assert.deepStrictEqual(fs.readdirSync(dir), []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a folder counts as writable only if a file can really be made in it', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+  const { writable } = require('../src/main/updates');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdplayer-w-'));
+  try {
+    assert.strictEqual(writable(dir), true);
+    assert.deepStrictEqual(fs.readdirSync(dir), []); // the probe is gone
+    fs.chmodSync(dir, 0o555);
+    assert.strictEqual(writable(dir), false);
+    assert.strictEqual(writable(path.join(dir, 'missing')), false);
+  } finally { fs.chmodSync(dir, 0o755); fs.rmSync(dir, { recursive: true, force: true }); }
+});

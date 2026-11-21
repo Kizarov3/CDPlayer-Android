@@ -1,0 +1,450 @@
+'use strict';
+/**
+ * Persistent state, stored in exactly the same place and line-based formats as the original Java CDPlayer
+ * (~/.cdplayer on macOS/Linux, %LOCALAPPDATA%\CDPlayer on Windows) so an existing queue, history, settings, EQ
+ * presets and Spotify sign-in carry straight over. CDPLAYER_HOME overrides the location (used by tests so they
+ * never touch a real user's state).
+ */
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { entryExists } = require('./cue');
+
+let resolvedDir = null;
+function dataDir() {
+  if (process.env.CDPLAYER_HOME) return process.env.CDPLAYER_HOME;
+  if (resolvedDir) return resolvedDir;
+  const unixStyle = path.join(os.homedir(), '.cdplayer');
+  if (process.platform === 'win32') {
+    // The Windows-only Java fork kept its data in %LOCALAPPDATA%\CDPlayer, while the cross-platform Java build used
+    // ~\.cdplayer on Windows too — pick up whichever one this user already has.
+    resolvedDir = windowsDataDir(path.join(process.env.LOCALAPPDATA || os.homedir(), 'CDPlayer'), unixStyle);
+  } else {
+    resolvedDir = unixStyle;
+  }
+  return resolvedDir;
+}
+// %LOCALAPPDATA%\CDPlayer unless only ~\.cdplayer has this user's things in it. The portable .exe unpacks the app
+// into %LOCALAPPDATA%\CDPlayer\app before it starts, so that folder being there says nothing: it counts only with
+// something else in it.
+function windowsDataDir(local, unixStyle) {
+  let hasData = false;
+  try { hasData = fs.readdirSync(local).some((f) => f.toLowerCase() !== 'app'); } catch { /* not there */ }
+  return !hasData && fs.existsSync(unixStyle) ? unixStyle : local;
+}
+
+const file = (name) => path.join(dataDir(), name);
+const FILES = {
+  queue: 'queue.txt', onboarded: 'onboarded', lastVersion: 'lastversion.txt', lastPath: 'lastpath.txt', musicFolders: 'music-folders.txt',
+  settings: 'settings.txt', eqPresets: 'eq-presets.txt', history: 'history.txt', spotify: 'spotify.txt',
+  miniPosition: 'mini-position.txt', plays: 'plays.txt', lastPlayed: 'lastplayed.txt', dust: 'dust.txt', notes: 'notes.txt', hiddenMissing: 'missing-hidden.txt', wrap: 'wrap.txt', firstPlayed: 'firstplayed.txt', shelfColors: 'shelf-colors.json', changer: 'changer.txt', changerQueue: 'changer-queue.txt', remote: 'remote.json', movesDeclined: 'moves-declined.txt', skipped: 'skipped.txt', dividers: 'dividers.txt', wantList: 'want-list.json', pet: 'pet.json',
+};
+
+function readText(name) {
+  try { return fs.readFileSync(file(name), 'utf8'); } catch { return null; }
+}
+// Frozen while a backup is put back (backup.js): nothing written on the way out over what it brought.
+let frozen = false;
+const freeze = (on = true) => { frozen = on; };
+function writeText(name, content) {
+  if (frozen) return false;
+  try {
+    fs.mkdirSync(dataDir(), { recursive: true });
+    // Write-then-rename so a crash mid-write can never leave a half-written state file behind.
+    const target = file(name), tmp = `${target}.tmp`;
+    fs.writeFileSync(tmp, content, 'utf8');
+    fs.renameSync(tmp, target);
+    return true;
+  } catch { return false; }
+}
+// A line added to the end (a log written as it grows: listens.txt); not while a backup is put back either.
+function appendText(name, content) {
+  if (frozen) return false;
+  try { fs.mkdirSync(dataDir(), { recursive: true }); fs.appendFileSync(file(name), content, 'utf8'); return true; } catch { return false; }
+}
+// Same semantics as Java's Files.readAllLines: a final line terminator doesn't start another (empty) line.
+const lines = (text) => {
+  if (text == null || text === '') return [];
+  const l = text.split(/\r?\n/);
+  if (l[l.length - 1] === '') l.pop();
+  return l;
+};
+const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+const safePath = (p) => typeof p === 'string' && !/[\r\n]/.test(p);
+
+// settings.txt — one value per line, in the Java app's order: volume, crossfade, mono, animations, theme, EQ
+// gains, waveform, mini mode, window bounds, ambient background, then Discord status, disc noise and saving found
+// art & lyrics into files, the lyrics offset in ms, how the shelf is sorted, disc wear, the audio output ("id<TAB>name") and the language (AUTO, en or a locale code), then the sound quality (HIGH, LOSSLESS or HIRES), spatial audio (1/0) and its amount (0–100), the disc's shine (1/0) and the disc on the app's icon (1/0; on unless turned off, but off on Windows unless turned on) and Sound Check (OFF, TRACK or ALBUM), then the CD changer mode (ON/OFF), then SHUFFLE and REPEAT for the queue and for the changer ("OFF ALL DISC TRACK"), then the display under the seek bar (DECK or CLASSIC), then TRANSITION (OFF, AUTOMIX or CROSSFADE) and the crossfade's seconds, kept while another is picked, then streaming (ON/OFF), then the player's LOOK (CLASSIC, VISUALIZER, LYRICS, HIFI, ALBUM or CASE), then how the ambient background is drawn (COVER or GRADIENT), then what RIP saves a CD as (FLAC, MP3 or WAV), then the words in Latin letters too (1/0)
+// (CDPlayer 2 only; the second line still holds the crossfade's seconds while it's the one picked, else 0, as the Java app reads it). Missing trailing
+// lines keep their defaults.
+const DEFAULT_SETTINGS = {
+  volume: 100, crossfade: 5, mono: false, animations: true, theme: 'RED', eq: new Array(10).fill(0),
+  waveform: true, miniMode: false, bounds: null, ambient: true, discord: false, discNoise: false, saveFound: false, lyricsOffset: 0, shelfSort: 'ARTIST', discWear: true, output: null, language: 'AUTO', quality: 'HIGH', spatial: false, spatialAmount: 50, discShine: true, taskbarDisc: process.platform !== 'win32', soundCheck: 'OFF', changer: false, playModes: defaultPlayModes(), display: 'DECK', transition: 'OFF', streaming: false, look: 'CLASSIC', ambientStyle: 'COVER', ripFormat: 'FLAC', romanize: false, pet: false,
+};
+const SHELF_SORTS = ['ARTIST', 'NEW', 'PLAYED', 'RECENT', 'YEAR', 'COLOR', 'PRICE', 'MINE'];
+const QUALITIES = ['HIGH', 'LOSSLESS', 'HIRES'];
+const SOUND_CHECKS = ['OFF', 'TRACK', 'ALBUM'];
+const TRANSITIONS = ['OFF', 'AUTOMIX', 'CROSSFADE'];
+const DISPLAYS = ['DECK', 'CLASSIC'];
+const RIP_FORMATS = ['FLAC', 'MP3', 'WAV'];
+const LOOKS = ['CLASSIC', 'VISUALIZER', 'LYRICS', 'HIFI', 'ALBUM', 'CASE', 'TERMINAL'];
+// (the looks' older names: the same looks, done again; GLASS is gone)
+const OLD_LOOKS = { DOCK: 'VISUALIZER', STAGE: 'LYRICS', PANEL: 'HIFI', COVER: 'ALBUM' };
+// SHUFFLE and REPEAT: each mode keeps its own.
+const SHUFFLES = { QUEUE: ['OFF', 'ALL'], CHANGER: ['OFF', 'DISC', 'ALL'] }, REPEATS = { QUEUE: ['OFF', 'TRACK', 'ALL'], CHANGER: ['OFF', 'TRACK', 'DISC', 'ALL'] };
+function defaultPlayModes() { return { QUEUE: { shuffle: 'OFF', repeat: 'OFF' }, CHANGER: { shuffle: 'OFF', repeat: 'OFF' } }; }
+function readPlayModes(line) {
+  const [qs, qr, cs, cr] = String(line || '').trim().split(/\s+/);
+  const one = (v, list) => (list.includes(v) ? v : 'OFF');
+  return { QUEUE: { shuffle: one(qs, SHUFFLES.QUEUE), repeat: one(qr, REPEATS.QUEUE) }, CHANGER: { shuffle: one(cs, SHUFFLES.CHANGER), repeat: one(cr, REPEATS.CHANGER) } };
+}
+const writePlayModes = (m) => { const r = readPlayModes(m ? [m.QUEUE && m.QUEUE.shuffle, m.QUEUE && m.QUEUE.repeat, m.CHANGER && m.CHANGER.shuffle, m.CHANGER && m.CHANGER.repeat].join(' ') : ''); return [r.QUEUE.shuffle, r.QUEUE.repeat, r.CHANGER.shuffle, r.CHANGER.repeat].join(' '); };
+const LANGUAGE = /^(AUTO|[a-z]{2,3}(-[A-Za-z0-9]{2,8})*)$/;
+function readSettings() {
+  const l = lines(readText(FILES.settings));
+  const s = { ...DEFAULT_SETTINGS, eq: DEFAULT_SETTINGS.eq.slice() };
+  if (l.length < 3) return s;
+  const int = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; };
+  s.volume = Math.max(0, Math.min(100, int(l[0], 100)));
+  const seconds = Math.max(0, Math.min(15, int(l[1], 0)));
+  s.mono = l[2].trim() === '1';
+  s.animations = l.length < 4 || l[3].trim() === '1';
+  if (l.length >= 5 && l[4].trim()) s.theme = l[4].trim();
+  if (l.length >= 6 && l[5].trim()) {
+    const parts = l[5].split(',').map(Number);
+    if (parts.length === 10 && parts.every(Number.isFinite)) s.eq = parts;
+  }
+  s.waveform = l.length < 7 || l[6].trim() === '1';
+  s.miniMode = l.length >= 8 && l[7].trim() === '1';
+  if (l.length >= 9 && l[8].trim()) {
+    const b = l[8].split(',').map((v) => parseInt(v, 10));
+    if (b.length === 4 && b.every(Number.isFinite)) s.bounds = { x: b[0], y: b[1], width: b[2], height: b[3] };
+  }
+  s.ambient = l.length < 10 || l[9].trim() === '1';
+  s.discord = l.length >= 11 && l[10].trim() === '1'; // off unless turned on: it shows others what you listen to
+  s.discNoise = l.length >= 12 && l[11].trim() === '1';
+  s.saveFound = l.length >= 13 && l[12].trim() === '1';
+  if (l.length >= 14 && l[13].trim()) s.lyricsOffset = Math.max(-500, Math.min(500, Math.round(int(l[13], 0) / 50) * 50));
+  if (l.length >= 15 && SHELF_SORTS.includes(l[14].trim())) s.shelfSort = l[14].trim();
+  s.discWear = l.length < 16 || l[15].trim() !== '0';
+  if (l.length >= 17 && l[16].includes('\t')) { const [id, label] = l[16].split('\t'); if (id) s.output = { id, label: label || '' }; }
+  const language = l.length >= 18 ? l[17].trim() : '';
+  s.language = LANGUAGE.test(language) ? language : 'AUTO';
+  s.quality = l.length >= 19 && QUALITIES.includes(l[18].trim()) ? l[18].trim() : 'HIGH';
+  s.spatial = l.length >= 20 && l[19].trim() === '1';
+  s.spatialAmount = l.length >= 21 && l[20].trim() ? Math.max(0, Math.min(100, int(l[20], 50))) : 50;
+  s.discShine = l.length < 22 || l[21].trim() !== '0';
+  if (l.length >= 23 && ['0', '1'].includes(l[22].trim())) s.taskbarDisc = l[22].trim() === '1';
+  s.soundCheck = l.length >= 24 && SOUND_CHECKS.includes(l[23].trim()) ? l[23].trim() : 'OFF';
+  s.changer = l.length >= 25 && l[24].trim() === 'ON';
+  s.playModes = readPlayModes(l[25]);
+  s.display = l.length >= 27 && DISPLAYS.includes(l[26].trim()) ? l[26].trim() : 'DECK';
+  // A file without the line (older, or the Java app's): CROSSFADE if it had seconds, else OFF. ("1": AUTOMIX's first line.)
+  const [mode, kept] = String(l[27] || '').trim().split(/\s+/), keptSeconds = int(kept, 0);
+  s.transition = TRANSITIONS.includes(mode) ? mode : mode === '1' ? 'AUTOMIX' : seconds > 0 ? 'CROSSFADE' : 'OFF';
+  s.crossfade = keptSeconds >= 1 && keptSeconds <= 15 ? keptSeconds : seconds > 0 ? seconds : 5;
+  s.streaming = String(l[28] || '').trim() === 'ON';
+  const look = String(l[29] || '').trim();
+  s.look = LOOKS.includes(look) ? look : OLD_LOOKS[look] || 'CLASSIC';
+  s.ambientStyle = String(l[30] || '').trim() === 'GRADIENT' ? 'GRADIENT' : 'COVER';
+  const ripFormat = String(l[31] || '').trim();
+  s.ripFormat = RIP_FORMATS.includes(ripFormat) ? ripFormat : 'FLAC';
+  s.romanize = String(l[32] || '').trim() === '1';
+  s.pet = String(l[33] || '').trim() === '1'; // DECK PET (pet.js)
+  return s;
+}
+function writeSettings(s) {
+  const eq = s.eq.map((g) => (Number.isInteger(g) ? g.toFixed(1) : String(g))).join(',');
+  const b = s.bounds ? `${s.bounds.x},${s.bounds.y},${s.bounds.width},${s.bounds.height}` : '';
+  const transition = TRANSITIONS.includes(s.transition) ? s.transition : 'OFF';
+  const seconds = Math.max(1, Math.min(15, Math.round(Number(s.crossfade) || 5)));
+  const content = [s.volume, transition === 'CROSSFADE' ? seconds : 0, s.mono ? 1 : 0, s.animations ? 1 : 0, s.theme, eq, s.waveform ? 1 : 0,
+    s.miniMode ? 1 : 0, b, s.ambient ? 1 : 0, s.discord === false ? 0 : 1, s.discNoise ? 1 : 0, s.saveFound ? 1 : 0, s.lyricsOffset || 0,
+    SHELF_SORTS.includes(s.shelfSort) ? s.shelfSort : 'ARTIST', s.discWear === false ? 0 : 1,
+    s.output && s.output.id ? `${s.output.id}\t${String(s.output.label || '').replace(/[\t\n]/g, ' ')}` : '',
+    LANGUAGE.test(s.language || '') ? s.language : 'AUTO',
+    QUALITIES.includes(s.quality) ? s.quality : 'HIGH', s.spatial ? 1 : 0,
+    Math.max(0, Math.min(100, Math.round(Number.isFinite(s.spatialAmount) ? s.spatialAmount : 50))), s.discShine === false ? 0 : 1, s.taskbarDisc ? 1 : 0,
+    SOUND_CHECKS.includes(s.soundCheck) ? s.soundCheck : 'OFF', s.changer ? 'ON' : 'OFF', writePlayModes(s.playModes),
+    DISPLAYS.includes(s.display) ? s.display : 'DECK', `${transition} ${seconds}`, s.streaming ? 'ON' : 'OFF',
+    LOOKS.includes(s.look) ? s.look : 'CLASSIC', s.ambientStyle === 'GRADIENT' ? 'GRADIENT' : 'COVER',
+    RIP_FORMATS.includes(s.ripFormat) ? s.ripFormat : 'FLAC', s.romanize ? '1' : '0', s.pet ? '1' : '0'].join('\n') + '\n';
+  return writeText(FILES.settings, content);
+}
+
+// queue.txt — "index,positionMicros" then one absolute path per line (a cue sheet track is "<.cue path>#<number>"). Missing files are dropped on restore,
+// remapping the saved index so it still points at the same track — but not those on a drive that isn't there just now
+// (awayNow): they stay, for when it's plugged in, instead of being gone from the queue for good once it's saved again.
+function readQueueFile(name, changerText) {
+  const l = lines(readText(name));
+  if (!l.length || !l[0].trim()) return null;
+  const [idx, pos] = l[0].trim().split(',');
+  const savedIndex = parseInt(idx, 10), savedPosition = parseInt(pos, 10) || 0;
+  const paths = [], savedPaths = [], missing = [], away = awayNow();
+  let awayCount = 0;
+  let mapped = -1, savedAt = -1;
+  for (let i = 1; i < l.length; i++) {
+    const p = l[i].trim();
+    if (!p) continue;
+    if (i - 1 === savedIndex) savedAt = savedPaths.length;
+    savedPaths.push(p);
+    const there = entryExists(p) || (away(p) && ++awayCount);
+    if (there) { if (i - 1 === savedIndex) mapped = paths.length; paths.push(p); } else missing.push(p);
+  }
+  if (!paths.length) return null;
+  const index = mapped >= 0 ? mapped : Math.max(0, Math.min(Number.isFinite(savedIndex) ? savedIndex : 0, paths.length - 1));
+  // changer.txt holds the changer's slots as runs of the queue as it was saved: the renderer reads it against
+  // savedPaths and takes the missing files out of their discs (changer.js restore).
+  return { paths, index, positionMicros: savedPosition, changerText, savedPaths, savedIndex: savedAt, missing, away: awayCount };
+}
+/**
+ * Whether a path is on something not there just now → a test: a music folder on the list that's missing, or a drive
+ * (/Volumes/…, /media/…, /run/media/…, /mnt/…, a Windows drive letter or network share) that isn't mounted.
+ */
+function awayNow() {
+  const gone = readMusicFolders().filter((f) => !isDir(f)), cache = new Map();
+  const root = (p) => {
+    const win = /^([a-z]:)[\\/]/i.exec(p) || /^(\\\\[^\\]+\\[^\\]+)/.exec(p);
+    if (win) return `${win[1]}${path.sep}`;
+    const m = /^\/(Volumes\/[^/]+|media\/[^/]+\/[^/]+|run\/media\/[^/]+\/[^/]+|mnt\/[^/]+)/.exec(p);
+    return m ? `/${m[1]}` : null;
+  };
+  return (p) => {
+    const file = String(p).replace(/#\d+$/, ''); // (a cue sheet's track: its sheet)
+    if (gone.some((f) => file.startsWith(f.endsWith(path.sep) ? f : f + path.sep))) return true;
+    const r = root(file);
+    if (!r) return false;
+    if (!cache.has(r)) cache.set(r, !isDir(r));
+    return cache.get(r);
+  };
+}
+/** The queue (queue mode, 2.14's queue.txt). */
+const readQueue = () => readQueueFile(FILES.queue, null);
+/**
+ * The changer's store: its list (changer-queue.txt, queue.txt's format) and slots (changer.txt). From the build where
+ * the changer was the queue there's no changer-queue.txt yet: queue.txt held the changer's list then.
+ */
+function readChangerQueue() {
+  if (!isFile(file(FILES.changerQueue))) {
+    if (!isFile(file(FILES.changer))) return null;
+    // Once: the changer takes queue.txt's list as its own file now, before the queue saves its own over it.
+    const text = readText(FILES.queue);
+    if (text) writeText(FILES.changerQueue, text);
+  }
+  return readQueueFile(FILES.changerQueue, readText(FILES.changer));
+}
+/** The mode's store: the queue's queue.txt, or (mode CHANGER) changer-queue.txt and changer.txt (`changer`, its slots). */
+function writeQueue({ paths, index, positionMicros, changer, mode = 'QUEUE' }) {
+  const body = paths.filter(safePath).join('\n');
+  const text = `${index},${Math.max(0, Math.round(positionMicros || 0))}\n${body}${body ? '\n' : ''}`;
+  if (mode !== 'CHANGER') return writeText(FILES.queue, text);
+  const ok = writeText(FILES.changerQueue, text);
+  if (typeof changer === 'string') writeText(FILES.changer, changer);
+  return ok;
+}
+
+// plays.txt — "count<TAB>path" per line: how many times each track was played (for the booklet). CDPlayer 2 only.
+const PLAYS_LIMIT = 100000; // every song of a large library (a line each, written a moment after a play)
+function readPlayCounts() {
+  const counts = new Map();
+  for (const line of lines(readText(FILES.plays))) {
+    const tab = line.indexOf('\t'), n = parseInt(line.slice(0, tab), 10), p = line.slice(tab + 1).trim();
+    if (tab > 0 && n > 0 && p) counts.set(p, n);
+  }
+  return counts;
+}
+function writePlayCounts(counts) {
+  const entries = [...counts].filter(([p]) => safePath(p)).slice(-PLAYS_LIMIT); // the most recently played are last
+  return writeText(FILES.plays, entries.map(([p, n]) => `${n}\t${p}`).join('\n') + (entries.length ? '\n' : ''));
+}
+
+// lastplayed.txt — "ms<TAB>path" per line: when each track was last played (for dust on the shelf). CDPlayer 2 only.
+function readTimes(file) {
+  const times = new Map();
+  for (const line of lines(readText(file))) {
+    const tab = line.indexOf('\t'), t = Number(line.slice(0, tab)), p = line.slice(tab + 1).trim();
+    if (tab > 0 && t > 0 && p) times.set(p, t);
+  }
+  return times;
+}
+function writeTimes(file, times) {
+  const entries = [...times].filter(([p]) => safePath(p)).slice(-PLAYS_LIMIT); // the most recently played are last
+  return writeText(file, entries.map(([p, t]) => `${t}\t${p}`).join('\n') + (entries.length ? '\n' : ''));
+}
+const readLastPlayed = () => readTimes(FILES.lastPlayed);
+const writeLastPlayed = (times) => writeTimes(FILES.lastPlayed, times);
+// firstplayed.txt — the same, for when each track was first played (for the booklet's "1st spin"). CDPlayer 2 only.
+const readFirstPlayed = () => readTimes(FILES.firstPlayed);
+const writeFirstPlayed = (times) => writeTimes(FILES.firstPlayed, times);
+
+// dust.txt — "since <ms>": when dust started gathering on the shelf (so an update doesn't find it all dusty at once),
+// then "ms<TAB>album id" (JSON: an id has line breaks in it) for each album wiped clean. CDPlayer 2 only.
+function readDust() {
+  const dust = { since: null, wiped: new Map() };
+  for (const line of lines(readText(FILES.dust))) {
+    const since = /^since (\d+)$/.exec(line.trim());
+    if (since) { dust.since = Number(since[1]); continue; }
+    const tab = line.indexOf('\t'), t = Number(line.slice(0, tab));
+    try { const id = JSON.parse(line.slice(tab + 1)); if (tab > 0 && t > 0 && typeof id === 'string') dust.wiped.set(id, t); } catch { /* a broken line */ }
+  }
+  return dust;
+}
+function writeDust({ since, wiped }) {
+  const body = [...wiped].map(([id, t]) => `${t}\t${JSON.stringify(id)}`);
+  return writeText(FILES.dust, [`since ${since || Date.now()}`, ...body].join('\n') + '\n');
+}
+
+// notes.txt — "album id<TAB>note" per line, both as JSON (either can have line breaks in it): the sticky notes on
+// albums on the shelf. An empty note isn't kept. CDPlayer 2 only.
+// dividers.txt — the same, "album id<TAB>divider": the user's own divider card each album is filed behind.
+function readTextsById(file) {
+  const texts = new Map();
+  for (const line of lines(readText(file))) {
+    const tab = line.indexOf('\t');
+    try {
+      const id = JSON.parse(line.slice(0, tab)), text = JSON.parse(line.slice(tab + 1));
+      if (tab > 0 && typeof id === 'string' && typeof text === 'string' && text) texts.set(id, text);
+    } catch { /* a broken line */ }
+  }
+  return texts;
+}
+function writeTextsById(file, texts) {
+  const body = [...texts].filter(([, text]) => text).map(([id, text]) => `${JSON.stringify(id)}\t${JSON.stringify(text)}`);
+  return writeText(file, body.join('\n') + (body.length ? '\n' : ''));
+}
+const readNotes = () => readTextsById(FILES.notes);
+const writeNotes = (notes) => writeTextsById(FILES.notes, notes);
+const readDividers = () => readTextsById(FILES.dividers);
+const writeDividers = (dividers) => writeTextsById(FILES.dividers, dividers);
+
+// missing-hidden.txt — a MusicBrainz release-group ID per line: missing albums the user said NOT INTERESTED to, so
+// they don't stand on the shelf again. CDPlayer 2 only.
+const GROUP_ID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+// skipped.txt — a path a line: the songs not to play as the music moves on (they still play when picked).
+function readSkipped() {
+  return new Set(lines(readText(FILES.skipped)).filter((l) => l.trim()));
+}
+function writeSkipped(paths) {
+  const body = [...paths].filter((p) => p && !/[\n\r]/.test(p));
+  return writeText(FILES.skipped, body.join('\n') + (body.length ? '\n' : ''));
+}
+function readHiddenMissing() {
+  return new Set(lines(readText(FILES.hiddenMissing)).map((l) => l.trim()).filter((id) => GROUP_ID.test(id)));
+}
+function writeHiddenMissing(ids) {
+  const body = [...ids].filter((id) => GROUP_ID.test(String(id)));
+  return writeText(FILES.hiddenMissing, body.join('\n') + (body.length ? '\n' : ''));
+}
+
+// wrap.txt — "since <ms>": when new albums began coming shrink-wrapped (those on the shelf before are unwrapped), then
+// the IDs (JSON: an ID has line breaks in it) of albums unwrapped by hand before they were played. CDPlayer 2 only.
+function readWrap() {
+  const wrap = { since: null, torn: new Set() };
+  for (const line of lines(readText(FILES.wrap))) {
+    const since = /^since (\d+)$/.exec(line.trim());
+    if (since) { wrap.since = Number(since[1]); continue; }
+    try { const id = JSON.parse(line); if (typeof id === 'string') wrap.torn.add(id); } catch { /* a broken line */ }
+  }
+  return wrap;
+}
+function writeWrap({ since, torn }) {
+  return writeText(FILES.wrap, [`since ${since || Date.now()}`, ...[...torn].map((id) => JSON.stringify(id))].join('\n') + '\n');
+}
+
+// shelf-colors.json — each album's colours as the shelf worked them out from its cover: { [album id]: { key (of the
+// cover they came from), spine: [r, g, b], main: [r, g, b] } }, so a colour-sorted shelf stands at once. CDPlayer 2 only.
+function readShelfColors() {
+  try { const c = JSON.parse(readText(FILES.shelfColors) || ''); return c && c.version === 1 && c.colors ? c.colors : {}; } catch { return {}; }
+}
+const writeShelfColors = (colors) => writeText(FILES.shelfColors, JSON.stringify({ version: 1, colors }));
+
+const HISTORY_LIMIT = 200;
+function readHistory() {
+  return lines(readText(FILES.history)).map((p) => p.trim()).filter((p) => p && entryExists(p)).slice(0, HISTORY_LIMIT);
+}
+// Every path in history.txt, there or not: songs no longer where they were stay in it, unseen, after the others —
+// for a moved music folder to take along (relocate.js), or for an unplugged drive's songs to come back to.
+const readHistoryAll = () => lines(readText(FILES.history)).map((p) => p.trim()).filter(Boolean);
+function writeHistory(paths) {
+  const shown = paths.filter(safePath).slice(0, HISTORY_LIMIT), kept = new Set(shown);
+  const gone = readHistoryAll().filter((p) => !kept.has(p) && !entryExists(p)).slice(0, HISTORY_LIMIT);
+  const body = [...shown, ...gone].join('\n');
+  return writeText(FILES.history, body ? `${body}\n` : '');
+}
+// Replaced as it is (a move's history, already in order).
+function writeHistoryAll(paths) {
+  const body = paths.filter(safePath).slice(0, 2 * HISTORY_LIMIT).join('\n');
+  return writeText(FILES.history, body ? `${body}\n` : '');
+}
+
+// moves-declined.txt — "from<TAB>to" (JSON each) per line: moved folders the user said weren't the same songs, so the
+// shelf doesn't ask about them again. CDPlayer 2 only.
+function readMovesDeclined() {
+  const out = new Set();
+  for (const line of lines(readText(FILES.movesDeclined))) {
+    const tab = line.indexOf('\t');
+    try { const from = JSON.parse(line.slice(0, tab)), to = JSON.parse(line.slice(tab + 1)); if (tab > 0) out.add(`${from}\n${to}`); } catch { /* a broken line */ }
+  }
+  return out;
+}
+function writeMovesDeclined(keys) {
+  const body = [...keys].map((k) => { const [from, to] = k.split('\n'); return `${JSON.stringify(from)}\t${JSON.stringify(to)}`; });
+  return writeText(FILES.movesDeclined, body.join('\n') + (body.length ? '\n' : ''));
+}
+
+function readEqPresets() {
+  const out = [];
+  for (const line of lines(readText(FILES.eqPresets))) {
+    const bar = line.lastIndexOf('|');
+    if (bar < 1) continue;
+    const name = line.slice(0, bar).trim();
+    const gains = line.slice(bar + 1).split(',').map(Number);
+    if (name && gains.length === 10 && gains.every(Number.isFinite)) out.push({ name, gains });
+  }
+  return out;
+}
+function writeEqPresets(presets) {
+  return writeText(FILES.eqPresets, presets.map((p) => `${p.name}|${p.gains.join(',')}`).join('\n') + (presets.length ? '\n' : ''));
+}
+
+function readLastPath() {
+  const t = readText(FILES.lastPath);
+  const p = t && t.trim();
+  return p || null;
+}
+function writeLastPath(dir) { if (dir && safePath(dir)) writeText(FILES.lastPath, dir); }
+
+// The folders the shelf, the search and the phone read, one path a line — their own list, so a song opened from
+// Downloads or a playlist saved on the Desktop (which only move where the next dialog opens) never change the shelf.
+// Before there was a list, the music folder was the last folder a dialog had opened in: that one, kept as the list
+// the first time it's asked for.
+let knownFolders = null; // the list as last read: for a moment the file can't be (another program has it open)
+function readMusicFolders() {
+  const text = readText(FILES.musicFolders);
+  if (text !== null) return (knownFolders = text.split('\n').map((l) => l.trim()).filter(Boolean));
+  if (isFile(file(FILES.musicFolders))) return knownFolders || []; // there, but unreadable just now: never started over
+  const last = readLastPath() || (process.platform === 'android' ? '/storage/emulated/0/Music' : null); // (a phone's music: its Music folder)
+  writeMusicFolders(last ? [last] : []);
+  return last ? [last] : [];
+}
+function writeMusicFolders(dirs) {
+  const list = [...new Set(dirs.filter((d) => d && safePath(d)))];
+  return writeText(FILES.musicFolders, list.length ? `${list.join('\n')}\n` : '');
+}
+/** No music folder chosen yet (the list read, and empty) — not merely a list that couldn't be read. */
+const noMusicFolderYet = () => readMusicFolders().length === 0 && readText(FILES.musicFolders) !== null;
+/** The music folders that are there now (an external drive unplugged stays on the list, and is read once it's back). */
+const musicFolders = () => readMusicFolders().filter(isDir);
+
+const isOnboarded = () => isFile(file(FILES.onboarded));
+const markOnboarded = () => writeText(FILES.onboarded, '');
+const readLastVersion = () => { const t = readText(FILES.lastVersion); return t && t.trim() ? t.trim() : null; };
+const writeLastVersion = (v) => writeText(FILES.lastVersion, v);
+
+module.exports = {
+  dataDir, windowsDataDir, file, FILES, readText, writeText, appendText, freeze, isFile, isDir,
+  readSettings, writeSettings, DEFAULT_SETTINGS, readQueue, readChangerQueue, writeQueue, readHistory, writeHistory, readHistoryAll, writeHistoryAll, readMovesDeclined, writeMovesDeclined, readSkipped, writeSkipped, HISTORY_LIMIT,
+  readPlayCounts, writePlayCounts, readLastPlayed, writeLastPlayed, readFirstPlayed, writeFirstPlayed, readDust, writeDust, readNotes, writeNotes, readDividers, writeDividers, readHiddenMissing, writeHiddenMissing, readWrap, writeWrap, readShelfColors, writeShelfColors,
+  readEqPresets, writeEqPresets, readLastPath, writeLastPath, readMusicFolders, writeMusicFolders, musicFolders, noMusicFolderYet, isOnboarded, markOnboarded, readLastVersion, writeLastVersion,
+};
