@@ -39,6 +39,9 @@ export function setUpPhoneUi(doc = document) {
     if (b) nav.append(b);
   }
   doc.body.append(nav);
+  // A new version's pill: up beside SETTINGS (the header's west side, with the desktop's CD buttons, isn't shown here).
+  const update = doc.getElementById('update-button'), east = doc.getElementById('header-east');
+  if (update && east) east.prepend(update);
   // The queue sheet's scrim (a tap closes it) and handle (pulled down, it closes).
   const scrim = doc.createElement('div');
   scrim.id = 'phone-scrim';
