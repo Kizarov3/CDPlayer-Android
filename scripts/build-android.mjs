@@ -60,7 +60,8 @@ async function buildApp() {
   fs.copyFileSync(path.join(root, 'src', 'android', 'ui', 'old-webview.html'), path.join(out, 'old-webview.html')); // (capacitor.config.json's errorPath)
   if (withBoot === html) throw new Error('index.html: no first-paint.js script to put android.js before');
   // Nothing from elsewhere on the page (the desktop's lets in Spotify's player): the page holds the bridges to the
-  // phone's files (NativeFs), which answer any frame or script in it.
+  // phone's files (NativeFs), which answer any frame or script in it. Spotify's player has a WebView of its own
+  // (SpotifyHostPlugin.java, android/app/src/main/assets/spotify/).
   const own = withBoot.replace(/ https:\/\/sdk\.scdn\.co/g, '').replace(/ frame-src[^;"]*;?/, " frame-src 'none';");
   if (/scdn|https:\/\//.test(own.match(/Content-Security-Policy" content="([^"]*)"/)[1])) throw new Error('index.html: CSP still lets in another site');
   fs.writeFileSync(path.join(out, 'index.html'), own);
@@ -69,7 +70,7 @@ async function buildApp() {
   const SHIMS = {
     fs: 'fs.js', 'fs/promises': 'fs-promises.js', path: 'path.js', os: 'os.js', url: 'url.js', crypto: 'crypto.js', electron: 'electron.js',
     stream: 'stream.js', 'stream/promises': 'stream.js', buffer: null, events: null, string_decoder: null,
-    child_process: 'not-on-android.js', worker_threads: 'worker-threads.js', net: 'not-on-android.js', http: 'not-on-android.js',
+    child_process: 'child-process.js', worker_threads: 'worker-threads.js', net: 'not-on-android.js', http: 'not-on-android.js',
     https: 'not-on-android.js', zlib: 'not-on-android.js', dgram: 'not-on-android.js', dns: 'not-on-android.js', tls: 'not-on-android.js',
     readline: 'not-on-android.js', util: 'not-on-android.js', assert: 'not-on-android.js',
   };
@@ -108,20 +109,23 @@ async function buildApp() {
     plugins: [shimPlugin],
   });
   // The desktop's workers that run on Android too, as Web Workers (shims/worker-threads.js maps their names here).
-  const WORKERS = { 'romanize-worker.js': 'romanize-worker.entry.js', 'word-fit-worker.js': 'word-fit-worker.entry.js' };
+  const WORKERS = { 'romanize-worker.js': 'romanize-worker.entry.js', 'word-fit-worker.js': 'word-fit-worker.entry.js', 'take-along-worker.js': 'take-along-worker.entry.js' };
   // (a worker has no NativeFs: the karaoke code's fs and zlib read the app's files beside it)
   const workerFiles = { name: 'worker-files', setup(b) { b.onResolve({ filter: /^(node:)?(fs|zlib)$/ }, () => ({ path: path.join(shims, 'worker-files.js') })); } };
   for (const [name, entry] of Object.entries(WORKERS)) {
-    const fitting = name === 'word-fit-worker.js';
+    const fitting = name === 'word-fit-worker.js', mp3 = name === 'take-along-worker.js';
     await esbuild.build({
       entryPoints: [path.join(root, 'src', 'android', entry)],
       outfile: path.join(out, 'workers', name),
       bundle: true, format: 'iife', platform: 'browser', target, sourcemap: release ? false : 'inline', logLevel: 'warning',
       mainFields: ['browser', 'module', 'main'], conditions: ['browser'],
-      define: { 'process.platform': '"android"', ...(fitting ? { __dirname: '"karaoke"' } : {}) },
-      plugins: fitting ? [workerFiles, shimPlugin] : [shimPlugin],
+      // (mp3.js reads LAME from encoders/lame/ beside it: put there below)
+      define: { 'process.platform': '"android"', ...(fitting ? { __dirname: '"karaoke"' } : mp3 ? { __dirname: '"encoders"' } : {}) },
+      plugins: fitting || mp3 ? [workerFiles, shimPlugin] : [shimPlugin],
     });
   }
+  fs.mkdirSync(path.join(out, 'workers', 'encoders', 'lame'), { recursive: true });
+  fs.copyFileSync(path.join(root, 'src', 'main', 'encoders', 'lame', 'lame.min.js'), path.join(out, 'workers', 'encoders', 'lame', 'lame.min.js'));
   // …and what it reads: the models, the dictionary (unzipped, see worker-files.js), onnxruntime's WebAssembly.
   const kOut = path.join(out, 'workers', 'karaoke');
   fs.mkdirSync(path.join(kOut, 'models'), { recursive: true });

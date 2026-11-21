@@ -102,7 +102,13 @@ public class PlaybackService extends Service {
             .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, now.artist)
             .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, now.album)
             .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, now.durationMs);
-        if (now.cover != null) meta.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, now.cover);
+        // (under each key a system reads it from: the lock screen and notification take the album art, others — One
+        // UI's status bar chip and Now Bar among them — the art or the display icon)
+        if (now.cover != null) {
+            meta.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, now.cover);
+            meta.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, now.cover);
+            meta.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, now.cover);
+        }
         session.setMetadata(meta.build());
         session.setPlaybackState(new PlaybackStateCompat.Builder()
             .setActions(PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE | PlaybackStateCompat.ACTION_PLAY_PAUSE
@@ -158,7 +164,7 @@ public class PlaybackService extends Service {
 
     private Notification buildNotification() {
         return new NotificationCompat.Builder(this, CHANNEL)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_disc)
             .setContentTitle(now.title)
             .setContentText(now.artist)
             .setLargeIcon(now.cover)

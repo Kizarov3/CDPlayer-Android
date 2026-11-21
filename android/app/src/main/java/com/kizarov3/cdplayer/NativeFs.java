@@ -137,4 +137,9 @@ public class NativeFs {
     @JavascriptInterface public String realpath(String path) {
         try { File f = allowed(path); if (!f.exists()) throw new FsError("ENOENT"); return new JSONObject().put("path", f.getCanonicalPath()).toString(); } catch (Exception e) { return error(e); }
     }
+
+    /** The room left where `path` is (fs.statfs's place, for TAKE ALONG). → { bavail, bsize } */
+    @JavascriptInterface public String statfs(String path) {
+        try { File f = allowed(path); return new JSONObject().put("bavail", f.getUsableSpace()).put("bsize", 1).toString(); } catch (Exception e) { return error(e); }
+    }
 }

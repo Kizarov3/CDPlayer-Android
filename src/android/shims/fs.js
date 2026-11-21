@@ -221,6 +221,7 @@ const promises = {
   writeFile: promised(writeFileSync), appendFile: promised(appendFileSync), mkdir: promised(mkdirSync), rm: promised(rmSync),
   rmdir: promised(rmdirSync), unlink: promised(unlinkSync), rename: promised(renameSync), copyFile: promised(copyFileSync),
   realpath: promised(realpathSync), access: promised(accessSync),
+  statfs: promised((p) => { p = P(p); return JSON.parse(call('statfs', p, (n) => n.statfs(p))); }), // (the room left: TAKE ALONG)
   open: promised((p) => { p = P(p); statSync(p); return new FileHandle(p); }),
 };
 const callbacked = (fn) => (...args) => {

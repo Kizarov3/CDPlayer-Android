@@ -19,15 +19,15 @@ const { spawn, execFile } = require('child_process');
 const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 const { httpFetch } = require('./http');
-// (Android's releases are in a repository of their own; there the pill opens the release's page, whose .apk the phone
-// installs itself — no file for 'android' below, so nothing's downloaded by the app)
+// (Android's releases are in a repository of their own; its .apk is downloaded and opened in Android's installer by
+// the Phone plugin — src/android/boot.entry.js puts its own downloadAsset and startInstaller in for these)
 const REPO = process.platform === 'android' ? 'Kizarov3/CDPlayer-Android' : 'Kizarov3/CDPlayer';
 const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
 const RELEASES_PAGE = `https://github.com/${REPO}/releases/latest`;
 const TIMEOUT_MS = 8000;
 const STALL_MS = 60000; // a download that's had nothing for this long is given up (the connection's gone)
 // The release's file for each system, by the end of its name (package.json → build → artifactName).
-const ASSET_SUFFIX = { darwin: '-mac.dmg', win32: '-windows.exe', linux: '-linux.AppImage' };
+const ASSET_SUFFIX = { darwin: '-mac.dmg', win32: '-windows.exe', linux: '-linux.AppImage', android: '-android.apk' };
 
 function parseVersion(v) {
   const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(v || '').trim());

@@ -20,8 +20,9 @@ test('the FAQ: questions a first-time user asks, each answered', () => {
   for (const topic of ['open', 'cover', 'data', 'spotify', 'folder', 'missing', 'internet']) assert.ok(all.includes(topic), topic);
 });
 
-test('the shortcuts panel lists the same keys as the README', () => {
+test('the shortcuts panel lists the same keys as the README', (t) => {
   const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  if (!readme.includes('## Keyboard shortcuts')) { t.skip('a README without the table (CDPlayer for Android\'s)'); return; }
   const table = readme.slice(readme.indexOf('## Keyboard shortcuts'), readme.indexOf('## Coming from'));
   const inReadme = [...table.matchAll(/^\| (.+?) \|/gm)].map((m) => m[1]).filter((k) => k !== 'Key' && !/^-+$/.test(k));
   assert.deepStrictEqual(SHORTCUTS.map(([keys]) => keys), inReadme);

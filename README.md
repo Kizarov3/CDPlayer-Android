@@ -18,7 +18,7 @@ Take `CDPlayer-x.y.z-android.apk` from [**Releases**](https://github.com/Kizarov
 
 - **Android 10 or newer.** It runs in Android System WebView 105 or newer; on an older one CDPlayer says so and links to its update.
 - **On first start** it asks for notifications (the player on the lock screen and in the notification shade), music, and photos (the covers and booklet scans in your album folders). Writing tags or found covers into your files asks for **All files access**, only when you turn that on.
-- **Updates:** when a new version is out, an **AVAILABLE** button appears at the top; it opens the release, and the new APK installs over the old one with everything kept.
+- **Updates:** when a new version is out, an **AVAILABLE** button appears at the top: tap it to download the update (checked against the release's SHA-256), then **INSTALL** — Android asks once to let CDPlayer install apps. The new version goes over the old one with everything kept. (Before 2.25.0 the button opened the release page.)
 - **Unverified developer:** Google is starting to ask apps installed from outside Play to come from verified developers. From September 30, 2026 in Brazil, Indonesia, Singapore and Thailand (elsewhere from 2027), Android may make you turn on **Allow apps from unverified developers** and wait 24 hours before installing.
 
 The release APK is signed with the certificate whose SHA-256 is
@@ -26,9 +26,9 @@ The release APK is signed with the certificate whose SHA-256 is
 
 ## What's on the phone
 
-Nearly all of the desktop CDPlayer: the shelf with its dust, dividers, notes and editions; the CD changer and the queue; every look (CLASSIC, VISUALIZER, LYRICS, HI-FI, ALBUM, JEWEL CASE, TERMINAL) and theme; gapless, AUTOMIX, the equalizer, crossfeed and Sound Check; playback with the screen off, from the lock screen and headset buttons; covers, disc photos and booklet scans; lyrics and karaoke with each word timed by the singing; MusicBrainz, Discogs, APPRAISE and the WANT LIST; Last.fm and ListenBrainz scrobbling; BLIP; share cards and videos; backup and restore, and importing plays.
+Nearly all of the desktop CDPlayer: the shelf with its dust, dividers, notes and editions; the CD changer and the queue; every look (CLASSIC, VISUALIZER, LYRICS, HI-FI, ALBUM, JEWEL CASE, TERMINAL) and theme; gapless, AUTOMIX, the equalizer, crossfeed and Sound Check; playback with the screen off, from the lock screen and headset buttons; covers, disc photos and booklet scans; lyrics and karaoke with each word timed by the singing; YouTube Music and SoundCloud; Spotify (Premium); mini mode (picture-in-picture, with the cover and the buttons); TAKE ALONG to a folder, an SD card or a USB stick; choosing the output (the phone's own switcher); MusicBrainz, Discogs, APPRAISE and the WANT LIST; Last.fm and ListenBrainz scrobbling; BLIP; share cards and videos; backup and restore, and importing plays.
 
-Not on the phone: audio CDs and ripping, Spotify, YouTube Music and SoundCloud, the phone remote, Discord status, mini mode, TAKE ALONG and choosing the output device.
+Not on the phone: audio CDs and ripping, the phone remote, Discord status, QUALITY's output-rate switching and the disc on the app icon.
 
 So far CDPlayer for Android has been tested on Android emulators only. If something's wrong on your phone, please open an [issue](https://github.com/Kizarov3/CDPlayer-Android/issues) with your phone's model and **COPY REPORT** from Settings → HELP.
 
@@ -47,7 +47,7 @@ The app is the desktop CDPlayer's own code (`src/main`, `src/renderer`) running 
 
 ## По-русски
 
-CDPlayer для телефона: музыка с телефона стоит на полке альбомами, диск крутится, пока играет, и всё стареет, как настоящие CD. Скачайте `CDPlayer-x.y.z-android.apk` из [**Releases**](https://github.com/Kizarov3/CDPlayer-Android/releases/latest) прямо на телефоне и откройте; Android один раз спросит разрешение устанавливать приложения из браузера. Нужен Android 10 или новее. Обновления: вверху появится кнопка **AVAILABLE**, она откроет страницу релиза, новый APK ставится поверх старого, всё сохраняется. Пока проверено только на эмуляторах: если что-то не так, откройте [issue](https://github.com/Kizarov3/CDPlayer-Android/issues) с моделью телефона и **COPY REPORT** из Настройки → HELP.
+CDPlayer для телефона: музыка с телефона стоит на полке альбомами, диск крутится, пока играет, и всё стареет, как настоящие CD. Скачайте `CDPlayer-x.y.z-android.apk` из [**Releases**](https://github.com/Kizarov3/CDPlayer-Android/releases/latest) прямо на телефоне и откройте; Android один раз спросит разрешение устанавливать приложения из браузера. Нужен Android 10 или новее. Обновления: вверху появится кнопка **AVAILABLE** — она скачает новую версию и поставит её поверх старой, всё сохраняется. Пока проверено только на эмуляторах: если что-то не так, откройте [issue](https://github.com/Kizarov3/CDPlayer-Android/issues) с моделью телефона и **COPY REPORT** из Настройки → HELP.
 
 ## License
 

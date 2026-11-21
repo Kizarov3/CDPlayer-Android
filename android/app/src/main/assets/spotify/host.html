@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <!-- Spotify's player, on its own: a WebView of its own with no bridge to the phone's files (SpotifyHost.java). Only
+       Spotify's script and frame come in; the app talks to it by messages (host.js). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://sdk.scdn.co; frame-src https://sdk.scdn.co; media-src blob: https:; connect-src https:">
+  <title>Spotify player</title>
+</head>
+<body>
+  <script src="host.js"></script>
+  <script src="https://sdk.scdn.co/spotify-player.js"></script>
+</body>
+</html>

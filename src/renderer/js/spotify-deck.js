@@ -6,6 +6,7 @@
 let sdk = null;
 /** Loads Spotify's player script once, on first use (never at startup — the player must work offline). */
 export function loadSpotifySdk(doc = document, win = window) {
+  if (win.cdp && win.cdp.spotifyPlayer) return win.cdp.spotifyPlayer(); // (Android: the SDK in a WebView of its own)
   if (sdk) return sdk;
   sdk = new Promise((resolve, reject) => {
     if (win.Spotify && win.Spotify.Player) { resolve(win.Spotify.Player); return; }

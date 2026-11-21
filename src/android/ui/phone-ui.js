@@ -61,6 +61,7 @@ export function setUpPhoneUi(doc = document) {
   const sheet = doc.getElementById('queue-card');
   if (sheet) sheet.before(scrim, handle); else doc.body.append(scrim, handle);
   gatherShelfButtons(doc);
+  setUpMiniWindow(doc);
   // SHELF in the bar lit while the shelf is open.
   const shelf = doc.getElementById('shelf'), shelfTab = doc.getElementById('shelf-button');
   if (shelf && shelfTab) {
@@ -74,6 +75,31 @@ export function setUpPhoneUi(doc = document) {
     e.stopImmediatePropagation();
     showQueue(doc, false);
   }, true);
+}
+
+// MINI MODE's small window (picture-in-picture, MainActivity): the cover playing, the song and its artist over it
+// (navigator.mediaSession's — media-session.js), the rest of the page hidden (html.pip in mobile.css).
+function setUpMiniWindow(doc) {
+  const box = doc.createElement('div');
+  box.id = 'phone-pip';
+  const cover = doc.createElement('div');
+  cover.className = 'pip-cover';
+  const words = doc.createElement('div');
+  words.className = 'pip-words';
+  const title = doc.createElement('b'), artist = doc.createElement('span');
+  words.append(title, artist);
+  box.append(cover, words);
+  doc.body.append(box);
+  let timer = null, shown = '';
+  const fill = () => {
+    const m = globalThis.navigator?.mediaSession?.metadata || {};
+    const src = (m.artwork && m.artwork[0] && m.artwork[0].src) || '';
+    if (src !== shown) { shown = src; cover.style.backgroundImage = src ? `url("${src.replace(/"/g, '%22')}")` : ''; cover.classList.toggle('none', !src); }
+    title.textContent = m.title || 'CDPlayer';
+    artist.textContent = m.artist || '';
+  };
+  doc.addEventListener('cdp-pip-on', () => { doc.documentElement.classList.add('pip'); fill(); clearInterval(timer); timer = setInterval(fill, 1000); });
+  doc.addEventListener('cdp-pip-off', () => { doc.documentElement.classList.remove('pip'); clearInterval(timer); timer = null; });
 }
 
 // The shelf's buttons (all but its search, here-button and CLOSE) into one row that scrolls sideways (mobile.css).

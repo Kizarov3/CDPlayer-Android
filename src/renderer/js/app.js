@@ -2873,6 +2873,7 @@ function toggleVisualizerMode() {
 
 // Mini Mode is a separate small window (see mini.js) — this window keeps playing, hidden, and just feeds it state.
 async function setMiniMode(enabled) {
+  if (onAPhone()) { if (enabled) cdp.enterMiniMode(); return; } // (a phone's is the small window over other apps)
   if (enabled === state.miniMode) return;
   if (enabled) {
     stepDiscMorph(0, true); // a CD View transition still running finishes first
@@ -3439,7 +3440,7 @@ function onKeyDown(e) {
 function showMoreMenu() {
   // (Android: no keyboard, header or files to load — what the keys open, in the bar's ⋯, with SEARCH first)
   const phone = document.body.dataset.platform === 'android';
-  const wanted = phone ? [t('KARAOKE'), t('VISUALIZER MODE'), t('NOW PLAYING CARD'), t('THE YEAR ON THE SHELF'), t('TURN THE DISC OVER')]
+  const wanted = phone ? [t('SPOTIFY'), t('KARAOKE'), t('VISUALIZER MODE'), t('NOW PLAYING CARD'), t('THE YEAR ON THE SHELF'), t('TURN THE DISC OVER')]
     : [t('CD VIEW'), t('LOAD A TRACK'), t('VISUALIZER MODE'), t('MINI MODE')];
   const items = commands().filter((c) => wanted.includes(c.label)).sort((a, b) => wanted.indexOf(a.label) - wanted.indexOf(b.label));
   const picks = items.map((c) => ({ label: c.label, key: phone ? undefined : c.key, pick: c.run }));
@@ -3494,10 +3495,10 @@ function commands() {
     { label: t('COPY REPORT'), also: 'bug report issue problem отчёт ошибка баг проблема', run: copyReport },
   ].filter(Boolean).filter((c) => !notOnAPhone(c.label));
 }
-// (what the search doesn't offer on a phone: no mini window, fullscreen, Spotify, files to load, player to copy to or keyboard)
+// (what the search doesn't offer on a phone: no fullscreen or files to load — nor the keys without a keyboard)
 function notOnAPhone(label) {
   return document.body.dataset.platform === 'android'
-    && [t('MINI MODE'), t('FULLSCREEN'), t('SPOTIFY'), t('LOAD A TRACK'), t('TAKE ALONG'), t('KEYBOARD SHORTCUTS')].includes(label);
+    && [t('FULLSCREEN'), t('LOAD A TRACK'), ...(document.body.classList.contains('has-keyboard') ? [] : [t('KEYBOARD SHORTCUTS')])].includes(label);
 }
 
 // The keys along the bottom: there until a few of them have been used — then only ? ALL KEYS, the rest are known.
@@ -3903,7 +3904,8 @@ function showUpdatePill() {
     button.textContent = t('DOWNLOADING {percent}%', { percent: Math.round((u.progress || 0) * 100) });
     button.title = t('Downloading CDPlayer {version}…', { version: u.version });
   } else if (u.phase === 'ready') {
-    button.textContent = u.install === 'replace' ? t('RESTART TO UPDATE') : t('INSTALL {version}', { version: u.version });
+    // (a phone: Android's installer puts it in, and the app opens again from its icon — no restart of its own)
+    button.textContent = u.install === 'replace' && !onAPhone() ? t('RESTART TO UPDATE') : t('INSTALL {version}', { version: u.version });
     button.title = u.install === 'replace' ? t('Install CDPlayer {version} and restart — your queue and changer are kept', { version: u.version }) : t('Open the downloaded CDPlayer {version} to install it', { version: u.version });
   } else {
     button.textContent = t('{version} AVAILABLE', { version: u.version });
@@ -3929,7 +3931,8 @@ async function onUpdateClick() {
     u.phase = 'installing';
     if (u.install === 'replace') { setStatus(t('UPDATING — BACK IN A MOMENT')); saveEverythingNow(); }
     const installed = await cdp.installUpdate().catch(() => { setStatus(t('COULDN’T INSTALL THE UPDATE')); cdp.openReleasesPage(); return true; });
-    if (installed === false) setStatus(t('COULDN’T INSTALL THE UPDATE')); // the download is shown to put in place by hand
+    // (a phone, the first time: Android's page to let CDPlayer install apps was opened — then the pill again)
+    if (installed === false) setStatus(onAPhone() ? t('ALLOW CDPLAYER TO INSTALL APPS, THEN TAP THE UPDATE AGAIN') : t('COULDN’T INSTALL THE UPDATE')); // the download is shown to put in place by hand
     u.phase = 'ready'; // still here: the download was opened or shown (or installing failed), so it can be again
     return;
   }

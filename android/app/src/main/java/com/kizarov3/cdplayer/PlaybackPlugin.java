@@ -43,6 +43,7 @@ public class PlaybackPlugin extends Plugin {
         if (cover != null && !cover.equals(coverKey)) { coverKey = cover; now.cover = decode(cover); }
 
         PlaybackService s = PlaybackService.instance;
+        MainActivity.refreshPip(); // (the small window's ⏯, and whether leaving the app makes it)
         if (s != null) PlaybackService.refreshSoon();
         else if (now.playing) ContextCompat.startForegroundService(getContext(), new Intent(getContext(), PlaybackService.class));
         call.resolve();
@@ -57,7 +58,12 @@ public class PlaybackPlugin extends Plugin {
         try {
             int comma = dataUrl.indexOf(',');
             byte[] bytes = Base64.decode(comma >= 0 ? dataUrl.substring(comma + 1) : dataUrl, Base64.DEFAULT);
-            return BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+            Bitmap b = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+            // (at most 512 px: a 3000 px scan is megabytes over Binder to every place that shows it)
+            int side = b == null ? 0 : Math.max(b.getWidth(), b.getHeight());
+            if (side <= 512) return b;
+            float k = 512f / side;
+            return Bitmap.createScaledBitmap(b, Math.round(b.getWidth() * k), Math.round(b.getHeight() * k), true);
         } catch (IllegalArgumentException e) {
             return null;
         }

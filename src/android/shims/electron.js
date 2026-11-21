@@ -143,15 +143,39 @@ const shell = {
 
 // Dialogs, through the phone's own (boot.entry.js sets `files` — Phone's pickFiles / createFile / ask): a file to open
 // comes as a copy in files/picked/; one to save is written in files/saving/ by the desktop's code and then put where the
-// user chose (fs.js's afterWrite). A folder to pick has none: the phone's music is found by its media library.
+// user chose (fs.js's afterWrite). A folder (TAKE ALONG's) comes as its path in shared storage.
 // Without them (tests), every dialog is cancelled and a question gets its default button.
 let files = null;
 const MIME = { m3u: 'audio/x-mpegurl', m3u8: 'audio/x-mpegurl', png: 'image/png', mp4: 'video/mp4', webm: 'video/webm', json: 'application/json', csv: 'text/csv', xml: 'text/xml', zip: 'application/zip' };
 const opts = (a, b) => (b || (a && !a.webContents && !a.isDestroyed ? a : {})) || {};
+// (the main process's text, in the interface's language — loaded when first needed)
+const t = (...args) => require('../../main/i18n').t(...args);
+function ownNewest(o) {
+  const fs = require('fs'), dir = String(o.defaultPath || ''), exts = (o.filters || []).flatMap((f) => f.extensions || []);
+  if (typeof fs.__filesDir !== 'function' || !dir.startsWith(`${fs.__filesDir()}/`) || !exts.length) return null;
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((n) => exts.some((x) => n.toLowerCase().endsWith(`.${x}`))).sort(); } catch { return null; }
+  if (!names.length) return null;
+  const p = `${dir}/${names[names.length - 1]}`;
+  return { path: p, day: new Date(fs.statSync(p).mtimeMs).toLocaleDateString(require('../../main/i18n').current().code) };
+}
 const dialog = {
   async showOpenDialog(a, b) {
     const o = opts(a, b), props = o.properties || [];
+    if (files && props.includes('openDirectory')) { // (a folder: TAKE ALONG's — on the phone, its card or a drive)
+      try { const { path } = await files.pickFolder(); return { canceled: !path, filePaths: path ? [path] : [] }; } catch { return { canceled: true, filePaths: [] }; }
+    }
     if (!files || props.includes('openDirectory')) return { canceled: true, filePaths: [] };
+    // (a folder of the app's own — the daily backups' — is out of the phone's picker's reach: its newest file offered first)
+    const newest = ownNewest(o);
+    if (newest) {
+      try {
+        const { response } = await files.ask({ message: t('The one made by itself on {day}, or another file?', { day: newest.day }), detail: '',
+          buttons: [t('THE ONE FROM {day}', { day: newest.day }), t('ANOTHER FILE…'), t('Cancel')], cancelId: 2 });
+        if (response === 0) return { canceled: false, filePaths: [newest.path] };
+        if (response !== 1) return { canceled: true, filePaths: [] };
+      } catch { return { canceled: true, filePaths: [] }; }
+    }
     try {
       const { paths } = await files.pick({ multiple: props.includes('multiSelections') });
       return { canceled: !paths.length, filePaths: paths };

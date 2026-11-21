@@ -1096,8 +1096,7 @@ async function openCase(a, spine) {
       a.arrived ? el('div', { class: 'case-since' }, t('ON YOUR SHELF SINCE {date}', { date: new Date(a.arrived).toLocaleDateString(locale, { day: 'numeric', month: 'long', year: 'numeric' }) }).toLocaleUpperCase()) : null,
       // (small, in one row with its editions: the actions underneath keep the track list its room in a small window)
       el('div', { class: 'case-tools' }, ...editionButtons(a, spine), addNote, fileButton,
-        document.body.dataset.platform === 'android' ? null // (the phone is where it would go)
-          : pill(t('TAKE ALONG'), () => app.takeAlong({ album: { title: a.title, paths: a.tracks.map((tr) => tr.path) } }), t('Copy this album to a portable player, a phone or an SD card'))),
+        pill(t('TAKE ALONG'), () => app.takeAlong({ album: { title: a.title, paths: a.tracks.map((tr) => tr.path) } }), t('Copy this album to a portable player, a phone or an SD card'))),
       pressingBlock(a, rare, (entry) => { if (receipt) receipt.showPressing(entry); showTag(entry); }),
       trackList,
       similarRow(a),

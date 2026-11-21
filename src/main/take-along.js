@@ -222,7 +222,14 @@ async function writeCover(folder, cover) {
  * failed, percent })`. → { written, there, failed: [{ path, why }] }; throws { reason: 'cancelled' | 'space' (with
  * need and free) | 'gone' | 'failed' }. A file that can't be read is passed over (in `failed`); the rest go on.
  */
-async function takeAlong({ albums, dest, format = 'COPY', signal, onProgress = () => {}, convert = convertInWorker, writeTags = tagWriter.writeTags, readTags = tagWriter.readTags, coverFor = async () => null, statfs }) {
+// How a song is made MP3 and how one is copied — Android's app puts its own in (src/android/boot.entry.js: a Web Worker
+// that reads the song by its address, and a copy made by the phone).
+const io = {
+  convert: convertInWorker,
+  copy: (src, temp, signal) => pipeline(fs.createReadStream(src), fs.createWriteStream(temp, { flags: 'wx' }), signal ? { signal } : {}),
+};
+
+async function takeAlong({ albums, dest, format = 'COPY', signal, onProgress = () => {}, convert = io.convert, writeTags = tagWriter.writeTags, readTags = tagWriter.readTags, coverFor = async () => null, statfs }) {
   format = FORMATS.includes(format) ? format : 'COPY';
   if (!dest || !(await statOf(dest))) throw stop('gone');
   const manifest = readManifest(dest);
@@ -255,7 +262,7 @@ async function takeAlong({ albums, dest, format = 'COPY', signal, onProgress = (
           const cover = await coverOf(it.album);
           await writeTags(temp, { ...keep, ...Object.fromEntries(Object.entries(it.tags).filter(([, v]) => v != null && v !== '')), ...(cover ? { cover } : {}) });
         } else {
-          await pipeline(fs.createReadStream(it.src), fs.createWriteStream(temp, { flags: 'wx' }), signal ? { signal } : {});
+          await io.copy(it.src, temp, signal);
         }
         if (signal && signal.aborted) throw stop('cancelled');
         await fsp.rename(temp, it.dest);
@@ -280,4 +287,4 @@ async function takeAlong({ albums, dest, format = 'COPY', signal, onProgress = (
   return { written, there, failed };
 }
 
-module.exports = { takeAlong, plan, planFiles, readManifest, convertInWorker, MANIFEST, FORMATS };
+module.exports = { takeAlong, plan, planFiles, readManifest, convertInWorker, io, MANIFEST, FORMATS };

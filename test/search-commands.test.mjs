@@ -50,6 +50,6 @@ test('on Android the search leaves out the settings rows Settings leaves out the
   }
   const phoneRows = [...src.slice(src.indexOf('function phoneRemoteRows('), src.indexOf('function presetName(')).matchAll(/row\(t\('([^']+)'\)/g)].map((m) => m[1]);
   assert.deepStrictEqual([...DESKTOP_ONLY_ROWS].sort(), [...new Set([...deskRows, ...phoneRows])].filter((r) => SETTING_ROWS.some((s) => s[1] === r)).sort());
-  assert.deepStrictEqual(findCommands('mini', [], DESKTOP_ONLY_ROWS), []);
-  assert.strictEqual(findCommands('mini', [])[0].row, 'MINI MODE');
+  assert.deepStrictEqual(findCommands('quality', [], DESKTOP_ONLY_ROWS), []);
+  assert.strictEqual(findCommands('quality', [])[0].row, 'QUALITY');
 });

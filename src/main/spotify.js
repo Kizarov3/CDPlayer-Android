@@ -185,32 +185,40 @@ function diagnose(code) {
   })[code] || { step: 4, text: t('Spotify didn’t let CDPlayer in. Try connecting again.') };
 }
 
+// Spotify's login page opened in the browser, and its redirect back to 127.0.0.1:8080 waited for (up to 3 minutes) →
+// the code it brings. Android's app puts its own in (src/android/boot.entry.js: the phone listens there instead).
+const io = {
+  waitForCode(clientId, state) {
+    const page = (h, p) => `<html><body style="font-family:sans-serif"><h2>${h}</h2><p>${p}</p></body></html>`;
+    return new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        const u = new URL(req.url, REDIRECT_URI);
+        if (u.pathname !== '/callback') { res.writeHead(404); res.end(); return; }
+        const error = u.searchParams.get('error'), got = u.searchParams.get('code');
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        if (error) { res.end(page('Spotify sign-in was cancelled', 'You can close this tab and try again in CDPlayer.')); finish(new Error(error)); }
+        else if (got && u.searchParams.get('state') === state) { res.end(page('Connected to Spotify', 'You can close this tab and return to CDPlayer.')); finish(null, got); }
+        else { res.end(page('Something went wrong', 'You can close this tab and try again in CDPlayer.')); finish(new Error('state mismatch')); }
+      });
+      const timer = setTimeout(() => finish(new Error('timed out waiting for sign-in')), 180000);
+      function finish(err, value) { clearTimeout(timer); server.close(); err ? reject(err) : resolve(value); }
+      server.on('error', (e) => finish(e));
+      server.listen(8080, '127.0.0.1', () => {
+        const auth = authorizeUrl(clientId, state);
+        shell.openExternal(auth);
+      });
+    });
+  },
+};
+
 function spotifySignIn() {
   if (signInInProgress) return signInInProgress;
   signInInProgress = (async () => {
     const { clientId } = credentials();
     if (!clientId) return t('SPOTIFY APP CREDENTIALS NOT CONFIGURED');
     const state = crypto.randomBytes(8).toString('hex');
-    const page = (h, p) => `<html><body style="font-family:sans-serif"><h2>${h}</h2><p>${p}</p></body></html>`;
     try {
-      const code = await new Promise((resolve, reject) => {
-        const server = http.createServer((req, res) => {
-          const u = new URL(req.url, REDIRECT_URI);
-          if (u.pathname !== '/callback') { res.writeHead(404); res.end(); return; }
-          const error = u.searchParams.get('error'), got = u.searchParams.get('code');
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-          if (error) { res.end(page('Spotify sign-in was cancelled', 'You can close this tab and try again in CDPlayer.')); finish(new Error(error)); }
-          else if (got && u.searchParams.get('state') === state) { res.end(page('Connected to Spotify', 'You can close this tab and return to CDPlayer.')); finish(null, got); }
-          else { res.end(page('Something went wrong', 'You can close this tab and try again in CDPlayer.')); finish(new Error('state mismatch')); }
-        });
-        const timer = setTimeout(() => finish(new Error('timed out waiting for sign-in')), 180000);
-        function finish(err, value) { clearTimeout(timer); server.close(); err ? reject(err) : resolve(value); }
-        server.on('error', (e) => finish(e));
-        server.listen(8080, '127.0.0.1', () => {
-          const auth = authorizeUrl(clientId, state);
-          shell.openExternal(auth);
-        });
-      });
+      const code = await io.waitForCode(clientId, state);
       const json = await postToken(`grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`);
       if (!json.access_token || !json.refresh_token) throw new Error('unexpected response');
       tokens.user = json.access_token;
@@ -369,6 +377,6 @@ function authorizeUrl(clientId, state) {
 module.exports = {
   SCOPES, REDIRECT_URI, credentials, status, saveCredentials, disconnect, authorizeUrl, resetForTests,
   getSpotifyAppToken, getSpotifyUserToken, accessToken, forgetUserToken, fetchJson,
-  classifySpotifyLink, resolveSpotifyLink, spotifySignIn,
+  classifySpotifyLink, resolveSpotifyLink, spotifySignIn, io,
   savedAlbums, playlists, search, discTracks, startPlayback, coverDataUrl, keyLooksRight, checkCredentials, verifyAccount, diagnose,
 };

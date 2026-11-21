@@ -45,6 +45,11 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.FileOutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.security.MessageDigest;
+import android.content.pm.PackageInfo;
 
 /**
  * The phone round the page: `Phone.setBars({ color: '#rrggbb', light })` — the status and navigation bars in the theme's
@@ -310,5 +315,251 @@ public class PhonePlugin extends Plugin {
                 thread.quitSafely();
             }, new Handler(thread.getLooper()));
         });
+    }
+
+    // ---- Updates (the desktop's: the pill downloads the release, a second tap installs it) ----
+
+    private static final String RELEASES = "https://github.com/Kizarov3/CDPlayer-Android/releases/download/";
+    private File updateFile; // the checked download, the one installUpdate may open
+
+    /**
+     * Downloads a release's APK into the cache — `url` (this app's own GitHub releases only), `name`, `size`, `sha256` —
+     * with 'updateProgress' { fraction } as it comes in, checking its size, SHA-256 and that it's this app, newer.
+     * → { path }
+     */
+    @PluginMethod public void downloadUpdate(PluginCall call) {
+        String url = call.getString("url", ""), name = call.getString("name", ""), sha = call.getString("sha256", "");
+        long size = call.getLong("size", 0L);
+        if (!url.startsWith(RELEASES) || !name.matches("[A-Za-z0-9._-]+\\.apk") || !sha.matches("[0-9a-f]{64}")) { call.reject("not this app's release"); return; }
+        new Thread(() -> {
+            File dir = new File(getContext().getCacheDir(), "updates");
+            dir.mkdirs();
+            File[] old = dir.listFiles();
+            if (old != null) for (File f : old) f.delete();
+            File part = new File(dir, name + ".part"), file = new File(dir, name);
+            HttpURLConnection c = null;
+            try {
+                c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(15000);
+                c.setReadTimeout(60000); // (nothing for a minute: the connection's gone)
+                c.setRequestProperty("User-Agent", "CDPlayer");
+                c.setInstanceFollowRedirects(true);
+                if (c.getResponseCode() != 200) throw new IOException("HTTP " + c.getResponseCode());
+                long total = size > 0 ? size : c.getContentLengthLong(), got = 0, reported = 0;
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                try (InputStream in = c.getInputStream(); OutputStream out = new FileOutputStream(part)) {
+                    byte[] buf = new byte[65536];
+                    for (int n; (n = in.read(buf)) > 0; ) {
+                        out.write(buf, 0, n);
+                        digest.update(buf, 0, n);
+                        got += n;
+                        long now = System.currentTimeMillis();
+                        if (total > 0 && now - reported > 250) {
+                            reported = now;
+                            JSObject p = new JSObject();
+                            p.put("fraction", Math.min(1.0, got / (double) total));
+                            notifyListeners("updateProgress", p);
+                        }
+                    }
+                }
+                if (size > 0 && got != size) throw new IOException("got " + got + " of " + size + " bytes");
+                StringBuilder hex = new StringBuilder();
+                for (byte b : digest.digest()) hex.append(String.format("%02x", b));
+                if (!hex.toString().equals(sha)) throw new IOException("checksum mismatch");
+                PackageManager pm = getContext().getPackageManager();
+                PackageInfo apk = pm.getPackageArchiveInfo(part.getPath(), 0);
+                PackageInfo self = pm.getPackageInfo(getContext().getPackageName(), 0);
+                if (apk == null || !getContext().getPackageName().equals(apk.packageName)) throw new IOException("not CDPlayer");
+                if (apk.getLongVersionCode() <= self.getLongVersionCode()) throw new IOException("not newer");
+                if (!part.renameTo(file)) throw new IOException("couldn't keep it");
+                updateFile = file;
+                JSObject ok = new JSObject();
+                ok.put("path", file.getPath());
+                call.resolve(ok);
+            } catch (Exception e) {
+                part.delete();
+                call.reject(String.valueOf(e.getMessage()));
+            } finally {
+                if (c != null) c.disconnect();
+            }
+        }).start();
+    }
+
+    /**
+     * Opens Android's installer on the downloaded update (it installs over this app, everything kept). The first time,
+     * Android asks to let CDPlayer install apps: its page is opened instead. → { started } or { needsPermission }
+     */
+    @PluginMethod public void installUpdate(PluginCall call) {
+        File f = updateFile;
+        if (f == null || !f.isFile()) { call.reject("nothing downloaded"); return; }
+        JSObject r = new JSObject();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !getContext().getPackageManager().canRequestPackageInstalls()) {
+            Intent allow = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getContext().getPackageName()));
+            getActivity().runOnUiThread(() -> getActivity().startActivity(allow));
+            r.put("needsPermission", true);
+            call.resolve(r);
+            return;
+        }
+        Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", f);
+        Intent install = new Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+        getActivity().runOnUiThread(() -> getActivity().startActivity(install));
+        r.put("started", true);
+        call.resolve(r);
+    }
+
+    // ---- OUTPUT: Android's own output picker (the WebView lists no devices; the phone routes the sound) ----
+
+    /** Android's output switcher for this app (speaker, headphones, Bluetooth, a cast speaker). */
+    @PluginMethod public void chooseOutput(PluginCall call) {
+        Activity a = getActivity();
+        a.runOnUiThread(() -> {
+            try {
+                if (Build.VERSION.SDK_INT >= 34) {
+                    android.media.MediaRouter2.getInstance(a).showSystemOutputSwitcher();
+                } else {
+                    a.startActivity(new Intent("com.android.settings.panel.action.MEDIA_OUTPUT")
+                        .putExtra("com.android.settings.panel.extra.PACKAGE_NAME", a.getPackageName()));
+                }
+            } catch (RuntimeException e) { // (no switcher on this phone: Bluetooth's page)
+                try { a.startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS)); } catch (RuntimeException ignored) { }
+            }
+            call.resolve();
+        });
+    }
+
+    /** Where the sound goes now. → { name } ('' for the phone's own speaker) */
+    @PluginMethod public void currentOutput(PluginCall call) {
+        android.media.AudioManager am = (android.media.AudioManager) getContext().getSystemService(android.content.Context.AUDIO_SERVICE);
+        String name = "";
+        int best = 0;
+        for (android.media.AudioDeviceInfo d : am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)) {
+            int t = d.getType(), rank;
+            if (t == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || t == 26 /* BLE headset */ || t == 27 /* BLE speaker */) rank = 3;
+            else if (t == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES || t == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET
+                || t == android.media.AudioDeviceInfo.TYPE_USB_HEADSET || t == android.media.AudioDeviceInfo.TYPE_USB_DEVICE) rank = 2;
+            else continue;
+            if (rank > best) {
+                best = rank;
+                CharSequence n = d.getProductName();
+                name = rank == 2 && (n == null || n.length() == 0 || n.toString().equals(Build.MODEL)) ? "HEADPHONES" : String.valueOf(n);
+            }
+        }
+        JSObject r = new JSObject();
+        r.put("name", name);
+        call.resolve(r);
+    }
+
+    // ---- MINI MODE (picture-in-picture: MainActivity) ----
+
+    /** { enabled }: leaving the app while it plays leaves it as a small window over the others. */
+    @PluginMethod public void setMiniMode(PluginCall call) {
+        MainActivity.miniMode = call.getBoolean("enabled", false);
+        MainActivity.refreshPip();
+        call.resolve();
+    }
+
+    /** Into the small window now. */
+    @PluginMethod public void enterMiniMode(PluginCall call) {
+        if (MainActivity.enterPip()) call.resolve(); else call.reject("no window");
+    }
+
+    // ---- TAKE ALONG: a folder on the phone, its SD card or a USB drive, and the songs copied into it ----
+
+    /** The system's folder picker → { path } (null when cancelled): a folder of shared storage, as a file path — the
+     *  desktop's take-along.js writes there itself (with All files access, which the page asks for first). */
+    @PluginMethod public void pickFolder(PluginCall call) {
+        startActivityForResult(call, new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), "pickedFolder");
+    }
+
+    @ActivityCallback private void pickedFolder(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        JSObject r = new JSObject();
+        Intent data = result.getData();
+        Uri tree = result.getResultCode() == Activity.RESULT_OK && data != null ? data.getData() : null;
+        if (tree == null) { r.put("path", null); call.resolve(r); return; }
+        if (!"com.android.externalstorage.documents".equals(tree.getAuthority())) { call.reject("not a folder on the phone, its card or a drive"); return; }
+        String id = android.provider.DocumentsContract.getTreeDocumentId(tree);
+        int colon = id.indexOf(':');
+        String volume = colon < 0 ? id : id.substring(0, colon), rel = colon < 0 ? "" : id.substring(colon + 1);
+        String base = "primary".equalsIgnoreCase(volume) ? Environment.getExternalStorageDirectory().getPath() : "/storage/" + volume;
+        r.put("path", rel.isEmpty() ? base : base + "/" + rel);
+        call.resolve(r);
+    }
+
+    /** One song copied, off the page's thread: { from, to } (both shared storage; `to` must be new). */
+    @PluginMethod public void copyFile(PluginCall call) {
+        String filesDir = NativeFs.canonicalFilesDir(getContext());
+        new Thread(() -> {
+            File to = null;
+            try {
+                File from = NativeFs.allowed(call.getString("from"), filesDir);
+                to = NativeFs.allowed(call.getString("to"), filesDir);
+                if (to.exists()) { call.reject("there already", "EEXIST"); return; }
+                try (InputStream in = new FileInputStream(from); OutputStream out = new FileOutputStream(to)) { copy(in, out); }
+                call.resolve();
+            } catch (IOException e) {
+                if (to != null) to.delete();
+                String m = String.valueOf(e.getMessage());
+                call.reject(m, m.contains("ENOSPC") || m.contains("No space") ? "ENOSPC" : m.contains("ENOENT") || e instanceof java.io.FileNotFoundException ? "ENOENT" : "EIO");
+            }
+        }).start();
+    }
+
+    /** Whether a keyboard with keys is plugged in (Bluetooth, USB, a case's). → { keyboard } */
+    @PluginMethod public void hasKeyboard(PluginCall call) {
+        JSObject r = new JSObject();
+        r.put("keyboard", getContext().getResources().getConfiguration().keyboard == android.content.res.Configuration.KEYBOARD_QWERTY);
+        call.resolve(r);
+    }
+
+    // ---- Spotify's sign-in: its page in the browser, its redirect back to http://127.0.0.1:8080/callback (the Redirect URI
+    // the user's Spotify app already has for the desktop) answered here ----
+
+    private static java.net.ServerSocket spotifyServer;
+
+    /** { url, state } → { code } once Spotify's page sends the browser back (3 minutes at most). */
+    @PluginMethod public void spotifySignIn(PluginCall call) {
+        String url = call.getString("url", ""), state = call.getString("state", "");
+        if (!url.startsWith("https://accounts.spotify.com/")) { call.reject("not Spotify's sign-in"); return; }
+        new Thread(() -> {
+            synchronized (PhonePlugin.class) { if (spotifyServer != null) try { spotifyServer.close(); } catch (IOException ignored) { } }
+            try (java.net.ServerSocket server = new java.net.ServerSocket(8080, 4, java.net.InetAddress.getByName("127.0.0.1"))) {
+                synchronized (PhonePlugin.class) { spotifyServer = server; }
+                server.setSoTimeout(180000);
+                getActivity().runOnUiThread(() -> getActivity().startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))));
+                while (true) {
+                    try (java.net.Socket s = server.accept()) {
+                        s.setSoTimeout(10000);
+                        java.io.BufferedReader in = new java.io.BufferedReader(new java.io.InputStreamReader(s.getInputStream(), "UTF-8"));
+                        String line = in.readLine();
+                        String path = line != null && line.startsWith("GET ") ? line.split(" ")[1] : "";
+                        Uri u = Uri.parse("http://127.0.0.1:8080" + path);
+                        OutputStream out = s.getOutputStream();
+                        if (!"/callback".equals(u.getPath())) { out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes("UTF-8")); continue; }
+                        String error = u.getQueryParameter("error"), code = u.getQueryParameter("code");
+                        boolean ok = error == null && code != null && state.equals(u.getQueryParameter("state"));
+                        String h = ok ? "Connected to Spotify" : error != null ? "Spotify sign-in was cancelled" : "Something went wrong";
+                        String p = ok ? "You can return to CDPlayer." : "You can try again in CDPlayer.";
+                        // (a tap on it opens the app: Android doesn't let an app in the background bring itself up)
+                        String back = "intent://back#Intent;scheme=cdplayer;package=" + getContext().getPackageName() + ";end";
+                        byte[] body = ("<html><head><meta name=viewport content='width=device-width'></head><body style='font-family:sans-serif'><h2>" + h + "</h2><p>" + p
+                            + "</p><p><a href='" + back + "' style='display:inline-block;padding:12px 20px;border-radius:24px;background:#e8412c;color:#fff;text-decoration:none;font-weight:600'>Back to CDPlayer</a></p></body></html>").getBytes("UTF-8");
+                        out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n").getBytes("UTF-8"));
+                        out.write(body);
+                        out.flush();
+                        if (ok) { JSObject r = new JSObject(); r.put("code", code); call.resolve(r); }
+                        else call.reject(error != null ? error : "state mismatch");
+                        return;
+                    }
+                }
+            } catch (java.net.SocketTimeoutException e) {
+                call.reject("timed out waiting for sign-in");
+            } catch (IOException e) {
+                call.reject(String.valueOf(e.getMessage()));
+            } finally {
+                synchronized (PhonePlugin.class) { spotifyServer = null; }
+            }
+        }).start();
     }
 }

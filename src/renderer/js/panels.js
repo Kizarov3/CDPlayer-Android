@@ -376,12 +376,21 @@ function buildSettings(app) {
     label: c, current: discogs && c === discogs.currency, pick: async () => { await app.cdp.discogsSetCurrency(c); await loadDiscogsSettings(app); app.discogsCurrencyChanged(); refreshSettingsIfOpen(app); },
   }))), t('The currency Discogs prices are shown in'));
   if (!discogs) loadDiscogsSettings(app).then(() => refreshSettingsIfOpen(app));
-  const outputButton = pill('…', async () => {
+  // (a phone: Android's own picker — the WebView lists no outputs; the button names where it plays now)
+  const phoneOutput = document.body.dataset.platform === 'android' && !!app.cdp.chooseOutput;
+  const outputButton = phoneOutput ? pill('…', () => app.cdp.chooseOutput(), t('Where the sound comes out: the speaker, headphones, Bluetooth…')) : pill('…', async () => {
     const devices = await app.listOutputs(), now = app.engine.outputId || '';
     showMenu(outputButton, [{ label: t('SYSTEM DEFAULT'), current: !now, pick: () => app.setOutput(null).then(() => refreshSettingsIfOpen(app)) },
       ...devices.map((d) => ({ label: outputName(d), current: d.deviceId === now, pick: () => app.setOutput(d).then(() => refreshSettingsIfOpen(app)) }))]);
   }, t('Where the sound comes out: speakers, headphones, AirPods…'));
-  app.currentOutputName().then((name) => { outputButton.textContent = name; });
+  const phoneOutputName = () => app.cdp.currentOutput().then((name) => {
+    outputButton.textContent = name === 'HEADPHONES' ? t('HEADPHONES') : name || t('PHONE SPEAKER');
+  });
+  if (phoneOutput) {
+    phoneOutputName();
+    // (Android's switcher is a sheet over the app, nothing tells the page it's done: looked at again while it's shown)
+    const watch = setInterval(() => { if (outputButton.isConnected) phoneOutputName(); else clearInterval(watch); }, 2000);
+  } else app.currentOutputName().then((name) => { outputButton.textContent = name; });
   const qualityButton = pill(levelName(s.quality), () => showMenu(qualityButton, LEVELS.map((level) => ({
     label: levelName(level, true), current: level === s.quality,
     pick: () => app.setQuality(level).then(() => refreshSettingsIfOpen(app)),
@@ -469,7 +478,10 @@ function buildSettings(app) {
     label: format, current: format === (s.ripFormat || 'FLAC'), pick: () => { app.setRipFormat(format); refreshSettingsIfOpen(app); },
   }))), t('What RIP saves an audio CD as'));
   const animations = toggle(anim.enabled, () => { app.setAnimations(!anim.enabled); setToggle(animations, anim.enabled); });
-  const mini = toggle(s.miniMode, () => app.setMiniMode(!s.miniMode));
+  // (a phone: a small window over other apps when it's left while playing — picture-in-picture, kept on the phone)
+  const mini = app.cdp.setPhoneMini
+    ? toggle(app.cdp.phoneMini(), () => { app.cdp.setPhoneMini(!app.cdp.phoneMini()); refreshSettingsIfOpen(app); })
+    : toggle(s.miniMode, () => app.setMiniMode(!s.miniMode));
   const discord = toggle(s.discord, () => { app.setDiscord(!s.discord); setToggle(discord, s.discord); });
   const discNoise = toggle(s.discNoise, () => { app.setDiscNoise(!s.discNoise); setToggle(discNoise, s.discNoise); });
   const discWear = toggle(s.discWear, () => { app.setDiscWear(!s.discWear); setToggle(discWear, s.discWear); });
@@ -508,9 +520,8 @@ function buildSettings(app) {
     unavailable(row(t('TRANSITION'), transitionButton)),
     ...(s.transition === 'CROSSFADE' ? [subRow(unavailable(sliderRow(t('LENGTH'), crossfade, crossfadeValue)))] : []),
     hint(TRANSITION_HINTS[s.transition] || TRANSITION_HINTS.OFF),
-    // (Android's WebView lists no outputs to pick: the phone routes the sound itself)
-    ...desk(unavailable(row(t('OUTPUT'), outputButton)),
-      quietHint(t('Each output keeps its own EQ, mono and spatial audio: headphones and speakers each sound as you set them.'))),
+    unavailable(row(t('OUTPUT'), outputButton)),
+    ...desk(quietHint(t('Each output keeps its own EQ, mono and spatial audio: headphones and speakers each sound as you set them.'))),
     ...desk(unavailable(row(t('QUALITY'), qualityButton)),
       hint(document.body.dataset.platform === 'linux' // no output-rate helper there
         ? t('Lossless plays each song at its own sample rate. On Linux, set your output’s rate in your sound settings (PipeWire can follow it by itself).')
@@ -554,22 +565,24 @@ function buildSettings(app) {
     hint(t('Stops once the album playing has ended (a changer disc, or the folder its songs are in) instead of going on into the next. A shuffled queue plays to its end.')),
     sliderRow(t('LYRICS OFFSET'), lyricsOffset, offsetValue),
     hint(t('Karaoke and the lyrics already follow what you hear, Bluetooth included. Move them if a song’s lyrics are timed a little off.')),
-    ...desk(row(t('MINI MODE'), mini)), gap(18),
+    row(t('MINI MODE'), mini),
+    ...(platform === 'android' ? [hint(t('Leave the app while it plays and it stays as a small window over the others: the cover, the song and its keys.'))] : []), gap(18),
     ...(platform === 'android' ? [] : [section(t('PHONE REMOTE')), ...phoneRemoteRows(app), gap(18)]),
     section(t('LIBRARY')),
     row(t('SAVE FOUND ART & LYRICS'), saveFound),
     hint(t('Covers and lyrics found online are written into the song’s file (once it’s finished playing), so they’re there offline and in other players too.')),
-    ...desk(row(t('YOUTUBE MUSIC & SOUNDCLOUD'), streaming),
-    hint(t('The search (/) also finds albums on YouTube Music and songs on SoundCloud — they play like your own discs.')),
-    quietHint(t('Unofficial: through the free yt-dlp, downloaded when this is turned on. YouTube’s terms don’t allow it, and it may stop working for a while when YouTube changes. Songs a label has locked (DRM) don’t play.')),
-    streamingNote),
+    row(t('YOUTUBE MUSIC & SOUNDCLOUD'), streaming),
+    hint(onPhone() ? t('The search also finds albums on YouTube Music and songs on SoundCloud — they play like your own discs.') : t('The search (/) also finds albums on YouTube Music and songs on SoundCloud — they play like your own discs.')),
+    quietHint(onPhone() ? t('Unofficial: through NewPipe’s free extractor, inside the app. YouTube’s terms don’t allow it, and it may stop working for a while when YouTube changes — till an update of CDPlayer. Songs a label has locked (DRM) don’t play.')
+      : t('Unofficial: through the free yt-dlp, downloaded when this is turned on. YouTube’s terms don’t allow it, and it may stop working for a while when YouTube changes. Songs a label has locked (DRM) don’t play.')),
+    streamingNote,
     ...desk(row(t('RIP FORMAT'), ripFormat),
     hint(RIP_HINTS[s.ripFormat] || RIP_HINTS.FLAC)),
     row(t('BACKUP'), el('div', { class: 'row-pills' },
       pill(t('SAVE…'), async () => { const r = await app.cdp.saveBackup().catch(() => ({ error: true })); if (r) app.setStatus(r.ok ? t('BACKUP SAVED') : t('UNKNOWN ERROR')); }, t('Save your queue, history, plays, notes, themes and settings to one file')),
       pill(t('RESTORE…'), async () => { const r = await app.cdp.restoreBackup().catch(() => ({ error: 'UNKNOWN ERROR' })); if (r && r.error) app.setStatus(r.error === 'NOT A BACKUP' ? t('NOT A CDPLAYER BACKUP') : t('UNKNOWN ERROR')); }, t('Put back what a backup kept: CDPlayer then starts again')))),
     hint(t('For a new computer, or after reinstalling: everything that’s yours in CDPlayer, but not your music, nor Spotify and Discogs sign-ins.')),
-    ...desk(quietHint(t('One is also made by itself each day, and the last 7 kept: RESTORE… opens where they are.'))), // (a phone's picker can't reach them)
+    quietHint(onPhone() ? t('One is also made by itself each day, and the last 7 kept: RESTORE… offers the newest.') : t('One is also made by itself each day, and the last 7 kept: RESTORE… opens where they are.')),
     row(t('IMPORT PLAYS'), el('div', { class: 'row-pills' }, pill(t('CHOOSE FILES…'), () => importPlays(app), t('The export from Last.fm, ListenBrainz, Spotify or Apple Music')))),
     hint(t('What you played on Last.fm, ListenBrainz, Spotify or Apple Music counts on the same songs here: their plays, dust and HISTORY. Imported again, nothing’s counted twice.')),
     quietHint(t('Spotify: Account → Privacy → Download your data (its .zip). Apple Music: File → Library → Export Library. Last.fm: a CSV from an exporter such as lastfm.ghan.nl. ListenBrainz: Settings → Export.')), gap(18),
@@ -594,7 +607,7 @@ function buildSettings(app) {
       pill(t("WHAT'S NEW"), () => showWhatsNew(app), t('What changed in each version, the newest first')),
       pill(t('WHAT’S SPECIAL'), () => showFeatures(app), t('Dust, Discogs prices, missing albums, disc wear — what other players don’t have')),
       pill(t('FAQ'), () => showFaq(), t('Answers to what people ask the first time')),
-      ...desk(pill(t('KEYBOARD SHORTCUTS'), () => showShortcuts(), t('Every key, also with ?'))),
+      ...(platform !== 'android' || document.body.classList.contains('has-keyboard') ? [pill(t('KEYBOARD SHORTCUTS'), () => showShortcuts(), t('Every key, also with ?'))] : []), // (a phone: with a keyboard)
       pill(t('COPY REPORT'), () => app.copyReport(), t('For a bug report: the version, your system, the output and the sound settings, and what happened lately — no paths to your music’s files'))));
   const version = el('div', { class: 'settings-version' }, `CDPlayer ${app.state.version}`);
   const pages = settingsPages([...body.children]);
@@ -1240,7 +1253,7 @@ function buildTakeAlong(app) {
     el('div', { class: 'take-line' }, line), ...notes.map((n) => quietHint(n)), running || (r && r.ok) ? bar : null,
     el('div', { class: 'close-row split' },
       running ? pill(t('CANCEL'), () => app.cdp.takeAlong.cancel(), t('Stop; the songs already written are kept'))
-        : r && r.ok ? pill(t('SHOW IN FOLDER'), () => app.cdp.takeAlong.showFolder()) : el('span', {}),
+        : r && r.ok && !onPhone() ? pill(t('SHOW IN FOLDER'), () => app.cdp.takeAlong.showFolder()) : el('span', {}), // (a phone has no folder window to open)
       el('span', { class: 'grow' }),
       pill(t('CLOSE'), () => closePanel('take-along')),
       running ? null : (() => { const go = el('button', { class: 'pill go', onClick: () => startTakeAlong(app) }, t('TAKE ALONG')); go.disabled = !ready; return go; })())];

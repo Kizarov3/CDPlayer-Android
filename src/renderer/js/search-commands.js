@@ -43,7 +43,7 @@ export const SETTING_ROWS = [
 ];
 
 /** The rows Settings leaves out on Android (panels.js desk()): the search doesn't offer them there either. */
-export const DESKTOP_ONLY_ROWS = ['OUTPUT', 'QUALITY', 'DISC ICON', 'MINI MODE', 'CONTROL FROM A PHONE', 'YOUTUBE MUSIC & SOUNDCLOUD',
+export const DESKTOP_ONLY_ROWS = ['QUALITY', 'DISC ICON', 'CONTROL FROM A PHONE',
   'RIP FORMAT', 'DISCORD STATUS'];
 
 const fold = (s) => String(s || '').toLowerCase().replace(/ё/g, 'е').normalize('NFD').replace(/\p{M}/gu, '');
