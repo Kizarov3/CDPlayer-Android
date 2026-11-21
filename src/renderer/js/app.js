@@ -3905,7 +3905,7 @@ function showUpdatePill() {
     button.title = t('Downloading CDPlayer {version}…', { version: u.version });
   } else if (u.phase === 'ready') {
     // (a phone: Android's installer puts it in, and the app opens again from its icon — no restart of its own)
-    button.textContent = u.install === 'replace' && !onAPhone() ? t('RESTART TO UPDATE') : t('INSTALL {version}', { version: u.version });
+    button.textContent = u.install === 'replace' ? t('RESTART TO UPDATE') : t('INSTALL {version}', { version: u.version });
     button.title = u.install === 'replace' ? t('Install CDPlayer {version} and restart — your queue and changer are kept', { version: u.version }) : t('Open the downloaded CDPlayer {version} to install it', { version: u.version });
   } else {
     button.textContent = t('{version} AVAILABLE', { version: u.version });
@@ -3923,6 +3923,8 @@ async function checkForUpdate() {
   showUpdatePill();
 }
 
+// (a phone: Android's install of the update didn't go through — cancelled at its "Update?", or refused)
+window.addEventListener('cdp-update-failed', () => { if (updateState.phase === 'ready') setStatus(t('COULDN’T INSTALL THE UPDATE')); });
 async function onUpdateClick() {
   const u = updateState;
   if (u.phase === 'downloading' || u.phase === 'installing') return;

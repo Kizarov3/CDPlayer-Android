@@ -44,6 +44,12 @@ public class StreamBridge {
         volatile String headers = "{}";
     }
 
+    // The WebView cuts a request's Range out of what shouldInterceptRequest answers itself (an answer to bytes=100-199 loses
+    // its first 100 bytes — a song's end, asked for first by the player, came empty and it never played): so the bytes
+    // before the range come first, as filler it skips (never fetched). Checked once by the page (PROBE, `sliced`), in case a WebView doesn't.
+    static final String PROBE = PATH + "probe";
+    private volatile boolean sliced = true;
+
     StreamBridge(WebView web) { this.web = web; }
 
     /** The WebView's requests: ours here, the rest to Capacitor's. */
@@ -62,6 +68,12 @@ public class StreamBridge {
     private void js(String code) { main.post(() -> web.evaluateJavascript(code, null)); }
 
     WebResourceResponse serve(WebResourceRequest request) {
+        if (PROBE.equals(request.getUrl().getPath())) { // (an answer from the start to bytes=1-1: "B" if the WebView cuts it)
+            Map<String, String> h = new HashMap<>();
+            h.put("Content-Range", "bytes 0-1/2");
+            h.put("Access-Control-Allow-Origin", "*");
+            return new WebResourceResponse("text/plain", null, 206, "Partial Content", h, new java.io.ByteArrayInputStream("AB".getBytes()));
+        }
         int id = ids.incrementAndGet();
         Pending p = new Pending();
         pending.put(id, p);
@@ -77,11 +89,20 @@ public class StreamBridge {
             JSONObject h = new JSONObject(p.headers);
             for (Iterator<String> k = h.keys(); k.hasNext(); ) {
                 String name = k.next(), value = h.getString(name);
-                if (name.equalsIgnoreCase("content-type")) mime = value; else headers.put(name, value);
+                if (name.equalsIgnoreCase("content-type")) mime = value.split(";")[0].trim(); else headers.put(name, value);
             }
         } catch (Exception ignored) { }
         headers.put("Access-Control-Allow-Origin", "*");
+        long skip = 0;
+        if (sliced && p.status == 206) {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("bytes (\\d+)-").matcher(headers.containsKey("content-range") ? headers.get("content-range") : "");
+            if (m.find() && Long.parseLong(m.group(1)) > 0) {
+                skip = Long.parseLong(m.group(1)); // (the headers stay the range's: the player checks them against its request)
+            }
+        }
+        final long filler = skip;
         InputStream body = new InputStream() {
+            private long skipped;
             private byte[] piece;
             private int at;
             private boolean done, asked;
@@ -100,11 +121,13 @@ public class StreamBridge {
                 return !done || (piece != null && at < piece.length);
             }
             @Override public int read() throws IOException {
+                if (skipped < filler) { skipped++; return 0; }
                 if (!fill()) return -1;
                 return piece[at++] & 0xff;
             }
             @Override public int read(byte[] b, int off, int len) throws IOException {
                 if (len == 0) return 0;
+                if (skipped < filler) { int n = (int) Math.min(len, filler - skipped); java.util.Arrays.fill(b, off, off + n, (byte) 0); skipped += n; return n; }
                 if (!fill()) return -1;
                 int n = Math.min(len, piece.length - at);
                 System.arraycopy(piece, at, b, off, n);
@@ -137,6 +160,9 @@ public class StreamBridge {
         Pending p = pending.get(id);
         if (p != null) p.pieces.offer(Base64.decode(base64, Base64.DEFAULT));
     }
+
+    /** The page's PROBE: whether this WebView cuts the range out itself. */
+    @JavascriptInterface public void setSliced(boolean value) { sliced = value; }
 
     @JavascriptInterface public void end(int id) {
         Pending p = pending.get(id);

@@ -10,6 +10,8 @@ import com.getcapacitor.annotation.ActivityCallback;
 import java.util.ArrayList;
 import java.util.List;
 import org.json.JSONArray;
+import android.app.PendingIntent;
+import android.content.pm.PackageInstaller;
 import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.ContentValues;
@@ -57,6 +59,8 @@ import android.content.pm.PackageInfo;
  */
 @CapacitorPlugin(name = "Phone")
 public class PhonePlugin extends Plugin {
+    private static PhonePlugin instance; // (for UpdateReceiver's word to the page)
+    @Override public void load() { instance = this; }
     /** The app to the background, as Home would — playback goes on (Android's back with nothing left to close). */
     @PluginMethod public void background(PluginCall call) {
         getActivity().runOnUiThread(() -> { getActivity().moveTaskToBack(true); call.resolve(); });
@@ -331,6 +335,7 @@ public class PhonePlugin extends Plugin {
         String url = call.getString("url", ""), name = call.getString("name", ""), sha = call.getString("sha256", "");
         long size = call.getLong("size", 0L);
         if (!url.startsWith(RELEASES) || !name.matches("[A-Za-z0-9._-]+\\.apk") || !sha.matches("[0-9a-f]{64}")) { call.reject("not this app's release"); return; }
+        synchronized (this) { if (downloading) { call.reject("already downloading"); return; } downloading = true; updateFile = null; }
         new Thread(() -> {
             File dir = new File(getContext().getCacheDir(), "updates");
             dir.mkdirs();
@@ -381,9 +386,11 @@ public class PhonePlugin extends Plugin {
                 call.reject(String.valueOf(e.getMessage()));
             } finally {
                 if (c != null) c.disconnect();
+                synchronized (this) { downloading = false; }
             }
         }).start();
     }
+    private boolean downloading; // (one download at a time: a second would delete the first's file)
 
     /**
      * Opens Android's installer on the downloaded update (it installs over this app, everything kept). The first time,
@@ -400,12 +407,45 @@ public class PhonePlugin extends Plugin {
             call.resolve(r);
             return;
         }
-        Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", f);
-        Intent install = new Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-        getActivity().runOnUiThread(() -> getActivity().startActivity(install));
-        r.put("started", true);
-        call.resolve(r);
+        // As the desktop's RESTART TO UPDATE: the new version put in by CDPlayer itself (a PackageInstaller session), and
+        // CDPlayer opened again once it's in (UpdateReceiver). Android 12 and newer let that go without asking once
+        // CDPlayer installed the version it replaces; till then (the APK opened from the browser) it asks "Update?" once.
+        new Thread(() -> {
+            PackageInstaller installer = getContext().getPackageManager().getPackageInstaller();
+            int id = -1;
+            try {
+                PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                params.setAppPackageName(getContext().getPackageName());
+                params.setSize(f.length());
+                if (Build.VERSION.SDK_INT >= 31) params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED);
+                id = installer.createSession(params);
+                try (PackageInstaller.Session session = installer.openSession(id)) {
+                    try (InputStream in = new java.io.FileInputStream(f); OutputStream out = session.openWrite("base.apk", 0, f.length())) {
+                        byte[] buf = new byte[65536];
+                        for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+                        session.fsync(out);
+                    }
+                    Intent status = new Intent(getContext(), UpdateReceiver.class).setAction(UpdateReceiver.STATUS);
+                    PendingIntent answer = PendingIntent.getBroadcast(getContext(), id, status,
+                        PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0));
+                    session.commit(answer.getIntentSender());
+                }
+                r.put("started", true);
+                call.resolve(r);
+            } catch (Exception e) {
+                if (id >= 0) try { installer.abandonSession(id); } catch (Exception ignored) { }
+                call.reject(String.valueOf(e.getMessage()));
+            }
+        }).start();
+    }
+
+    /** The install didn't go through (UpdateReceiver): 'updateFailed' { reason } to the page. */
+    static void updateFailed(String reason) {
+        PhonePlugin p = instance;
+        if (p == null) return;
+        JSObject m = new JSObject();
+        m.put("reason", reason);
+        p.notifyListeners("updateFailed", m);
     }
 
     // ---- OUTPUT: Android's own output picker (the WebView lists no devices; the phone routes the sound) ----
@@ -524,42 +564,65 @@ public class PhonePlugin extends Plugin {
         if (!url.startsWith("https://accounts.spotify.com/")) { call.reject("not Spotify's sign-in"); return; }
         new Thread(() -> {
             synchronized (PhonePlugin.class) { if (spotifyServer != null) try { spotifyServer.close(); } catch (IOException ignored) { } }
-            try (java.net.ServerSocket server = new java.net.ServerSocket(8080, 4, java.net.InetAddress.getByName("127.0.0.1"))) {
+            java.net.ServerSocket server = null;
+            try {
+                // (a sign-in just closed may hold the port a moment longer)
+                for (int tries = 0; server == null; tries++) {
+                    try { server = new java.net.ServerSocket(8080, 4, java.net.InetAddress.getByName("127.0.0.1")); }
+                    catch (java.net.BindException e) { if (tries >= 10) throw e; Thread.sleep(200); }
+                }
                 synchronized (PhonePlugin.class) { spotifyServer = server; }
                 server.setSoTimeout(180000);
                 getActivity().runOnUiThread(() -> getActivity().startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))));
                 while (true) {
-                    try (java.net.Socket s = server.accept()) {
-                        s.setSoTimeout(10000);
-                        java.io.BufferedReader in = new java.io.BufferedReader(new java.io.InputStreamReader(s.getInputStream(), "UTF-8"));
-                        String line = in.readLine();
-                        String path = line != null && line.startsWith("GET ") ? line.split(" ")[1] : "";
-                        Uri u = Uri.parse("http://127.0.0.1:8080" + path);
-                        OutputStream out = s.getOutputStream();
-                        if (!"/callback".equals(u.getPath())) { out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes("UTF-8")); continue; }
-                        String error = u.getQueryParameter("error"), code = u.getQueryParameter("code");
-                        boolean ok = error == null && code != null && state.equals(u.getQueryParameter("state"));
-                        String h = ok ? "Connected to Spotify" : error != null ? "Spotify sign-in was cancelled" : "Something went wrong";
-                        String p = ok ? "You can return to CDPlayer." : "You can try again in CDPlayer.";
-                        // (a tap on it opens the app: Android doesn't let an app in the background bring itself up)
-                        String back = "intent://back#Intent;scheme=cdplayer;package=" + getContext().getPackageName() + ";end";
-                        byte[] body = ("<html><head><meta name=viewport content='width=device-width'></head><body style='font-family:sans-serif'><h2>" + h + "</h2><p>" + p
-                            + "</p><p><a href='" + back + "' style='display:inline-block;padding:12px 20px;border-radius:24px;background:#e8412c;color:#fff;text-decoration:none;font-weight:600'>Back to CDPlayer</a></p></body></html>").getBytes("UTF-8");
-                        out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n").getBytes("UTF-8"));
-                        out.write(body);
-                        out.flush();
-                        if (ok) { JSObject r = new JSObject(); r.put("code", code); call.resolve(r); }
-                        else call.reject(error != null ? error : "state mismatch");
-                        return;
-                    }
+                    java.net.Socket s = server.accept(); // (its timing out is the 3 minutes)
+                    // One connection: a browser's empty preconnect, a probe or a malformed request is answered (or
+                    // dropped) and the wait goes on; only Spotify's redirect with this sign-in's state ends it.
+                    String[] answer;
+                    try { answer = answerCallback(s, state); }
+                    catch (IOException | RuntimeException e) { answer = null; }
+                    finally { try { s.close(); } catch (IOException ignored) { } }
+                    if (answer == null) continue;
+                    if (answer[0] != null) { JSObject r = new JSObject(); r.put("code", answer[0]); call.resolve(r); }
+                    else call.reject(answer[1]);
+                    return;
                 }
             } catch (java.net.SocketTimeoutException e) {
                 call.reject("timed out waiting for sign-in");
-            } catch (IOException e) {
-                call.reject(String.valueOf(e.getMessage()));
+            } catch (Exception e) {
+                call.reject(server != null && server.isClosed() ? "another sign-in started" : String.valueOf(e.getMessage()));
             } finally {
-                synchronized (PhonePlugin.class) { spotifyServer = null; }
+                synchronized (PhonePlugin.class) { if (spotifyServer == server) spotifyServer = null; }
+                if (server != null) try { server.close(); } catch (IOException ignored) { }
             }
         }).start();
+    }
+
+    /** One request to the loopback server → { code, null } or { null, error } for this sign-in, null for anything else. */
+    private String[] answerCallback(java.net.Socket s, String state) throws IOException {
+        s.setSoTimeout(10000);
+        java.io.BufferedReader in = new java.io.BufferedReader(new java.io.InputStreamReader(s.getInputStream(), "UTF-8"));
+        String line = in.readLine();
+        String[] parts = line == null ? new String[0] : line.split(" ");
+        String path = parts.length > 1 && "GET".equals(parts[0]) && parts[1].startsWith("/") ? parts[1] : "/";
+        Uri u = Uri.parse("http://127.0.0.1:8080" + path);
+        OutputStream out = s.getOutputStream();
+        // (only Spotify's answer to this sign-in: anything without its state is someone else's)
+        if (!"/callback".equals(u.getPath()) || !state.equals(u.getQueryParameter("state"))) {
+            out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".getBytes("UTF-8"));
+            return null;
+        }
+        String error = u.getQueryParameter("error"), code = u.getQueryParameter("code");
+        boolean ok = error == null && code != null;
+        String h = ok ? "Connected to Spotify" : error != null ? "Spotify sign-in was cancelled" : "Something went wrong";
+        String p = ok ? "You can return to CDPlayer." : "You can try again in CDPlayer.";
+        // (a tap on it opens the app: Android doesn't let an app in the background bring itself up)
+        String back = "intent://back#Intent;scheme=cdplayer;package=" + getContext().getPackageName() + ";end";
+        byte[] body = ("<html><head><meta name=viewport content='width=device-width'></head><body style='font-family:sans-serif'><h2>" + h + "</h2><p>" + p
+            + "</p><p><a href='" + back + "' style='display:inline-block;padding:12px 20px;border-radius:24px;background:#e8412c;color:#fff;text-decoration:none;font-weight:600'>Back to CDPlayer</a></p></body></html>").getBytes("UTF-8");
+        out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n").getBytes("UTF-8"));
+        out.write(body);
+        out.flush();
+        return ok ? new String[] { code, null } : new String[] { null, error != null ? error : "no code" };
     }
 }

@@ -32,6 +32,9 @@ require('child_process').__setYtDlp(async (args) => (await streams.run({ args })
 // The player's requests for a streamed song: the head of serveStream's answer, then a piece each time the player
 // reads on (nothing more fetched once it stops), till the end or till it lets go.
 const answering = new Map();
+// (StreamBridge's PROBE: whether this WebView cuts a range out of an answer itself — it does since at least 105)
+fetch(`${location.origin}/_cdpstream_/probe`, { headers: { Range: 'bytes=1-1' } }).then((r) => r.text())
+  .then((t) => globalThis.CdpStream.setSliced(t === 'B'), () => {});
 globalThis.__cdpStream = {
   async open(id, url, range) {
     const bridge = globalThis.CdpStream;
@@ -90,7 +93,9 @@ cdp.allowChangingFiles = async () => {
   return false;
 };
 // The update pill as on the desktop: a tap downloads the release's APK (checked: size, SHA-256, this app and newer),
-// the next opens Android's installer on it — which the first time asks to let CDPlayer install apps (false: app.js says so).
+// RESTART TO UPDATE puts it in (PhonePlugin.installUpdate) and CDPlayer opens again on the new version. The first time
+// Android asks to let CDPlayer install apps (false: app.js says so); an install that didn't go through says so too.
+phone.addListener('updateFailed', () => window.dispatchEvent(new CustomEvent('cdp-update-failed')));
 const updates = require('../main/updates.js');
 updates.installPlan = () => ({ kind: 'replace', target: 'apk' });
 updates.downloadAsset = async (asset, _dir, onProgress = () => {}) => {

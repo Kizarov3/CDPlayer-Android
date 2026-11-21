@@ -30,6 +30,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(SpotifyHostPlugin.class);
         super.onCreate(savedInstanceState);
         StreamBridge.install(bridge); // (a streamed song's sound for the player: /_cdpstream_/)
+        ((android.app.NotificationManager) getSystemService(NOTIFICATION_SERVICE)).cancel(UpdateReceiver.NOTIFICATION); // (opened: the update's "tap to open" is done)
         // (added before the first page has committed, so they're there when android.js runs. They answer every frame
         // of the page: the page's CSP lets in nothing but the app's own files — scripts/build-android.mjs — and
         // Capacitor sends any other address to the browser.)

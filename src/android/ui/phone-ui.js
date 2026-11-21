@@ -17,6 +17,11 @@ export function followTheme(setBars, doc = document) {
     setBars({ color, light });
   };
   new MutationObserver(look).observe(doc.documentElement, { attributes: true, attributeFilter: ['class', 'style'] });
+  // (Android puts the bars' icons back to its own after the mini window, a turn of the phone or a return to the app:
+  // WHITE's dark icons came back white on white — said again then)
+  const again = () => { last = ''; look(); };
+  doc.defaultView?.addEventListener('resize', again);
+  doc.addEventListener('visibilitychange', () => { if (doc.visibilityState === 'visible') again(); });
   look();
 }
 

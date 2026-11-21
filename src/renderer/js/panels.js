@@ -539,11 +539,11 @@ function buildSettings(app) {
     row(t('THEME'), themeButton),
     row(t('LANGUAGE'), languageButton), languageNote,
     row(t('PLAYER LOOK'), lookButton),
-    hint(t('CLASSIC: as it always was. VISUALIZER: the music drawn across the window, the keys in a bar along the bottom, the queue at the side. LYRICS: the song’s words down the side, lit as they’re sung. HI-FI: a CD player’s front, the keys and two level meters on one panel. ALBUM: the album’s cover instead of the disc, as in a streaming app. JEWEL CASE: the album’s plastic case, shut, its cover under the plastic, beside the player — it opens to hand the disc over and snaps shut again; click it for the booklet. TERMINAL: the player as a console’s screen, in characters: the disc turning in ASCII, frames, blocks for the waveform and the volume, every key by its name.')),
+    hint(onPhone() ? t('CLASSIC: as it always was. VISUALIZER: the music drawn across the screen, the keys in a bar along the bottom, the queue at the side. LYRICS: the song’s words down the side, lit as they’re sung. HI-FI: a CD player’s front, the keys and two level meters on one panel. ALBUM: the album’s cover instead of the disc, as in a streaming app. JEWEL CASE: the album’s plastic case, shut, its cover under the plastic, beside the player — it opens to hand the disc over and snaps shut again; tap it for the booklet. TERMINAL: the player as a console’s screen, in characters: the disc turning in ASCII, frames, blocks for the waveform and the volume, every key by its name.') : t('CLASSIC: as it always was. VISUALIZER: the music drawn across the window, the keys in a bar along the bottom, the queue at the side. LYRICS: the song’s words down the side, lit as they’re sung. HI-FI: a CD player’s front, the keys and two level meters on one panel. ALBUM: the album’s cover instead of the disc, as in a streaming app. JEWEL CASE: the album’s plastic case, shut, its cover under the plastic, beside the player — it opens to hand the disc over and snaps shut again; click it for the booklet. TERMINAL: the player as a console’s screen, in characters: the disc turning in ASCII, frames, blocks for the waveform and the volume, every key by its name.')),
     row(t('DISPLAY'), displayButton),
     hint(t('DECK: a glowing panel like a CD player’s — the track number and the time in segment digits. CLASSIC: just the times.')),
     row(t('DECK PET'), deckPet),
-    hint(t('BLIP, a little creature in the display’s dots: it hatches from an egg once you play an album through (or after an hour of music), grows with the music, and turns into what your listening says about you. It never goes hungry and never asks for anything. Double-click it for its card.')),
+    hint(onPhone() ? t('BLIP, a little creature in the display’s dots: it hatches from an egg once you play an album through (or after an hour of music), grows with the music, and turns into what your listening says about you. It never goes hungry and never asks for anything. Double-tap it for its card.') : t('BLIP, a little creature in the display’s dots: it hatches from an egg once you play an album through (or after an hour of music), grows with the music, and turns into what your listening says about you. It never goes hungry and never asks for anything. Double-click it for its card.')),
     row(t('WAVEFORM'), waveform),
     row(t('AMBIENT BACKGROUND'), ambient),
     hint(t('COVER: the album’s cover, blurred, behind the player. GRADIENT: as Apple Music has it — the cover in big blurred pieces, slowly turning round each other.')),
@@ -551,7 +551,7 @@ function buildSettings(app) {
     row(t('DISC WEAR'), discWear),
     hint(t('A disc played a lot looks it: scratches from ten plays of its album, fingerprints from fifty, chips from a hundred.')),
     row(t('DISC SHINE'), discShine),
-    hint(t('The rainbow reflection on the disc that follows your mouse, like a CD tilted under a lamp.')),
+    hint(onPhone() ? t('The rainbow reflection on the disc, like a CD tilted under a lamp.') : t('The rainbow reflection on the disc that follows your mouse, like a CD tilted under a lamp.')),
     ...desk(row(t('DISC ICON'), taskbarDisc),
       hint(platform === 'darwin' ? t('The Dock icon shows the disc that’s in. Off, it’s CDPlayer’s own icon.')
         : platform === 'win32' ? t('The taskbar button shows the disc that’s in. While it’s on, CDPlayer pinned to the taskbar opens as a button of its own beside the pin.')
@@ -1689,7 +1689,7 @@ function spotifyWizard(app, a, status, foot) {
   const intro = hint(t('Spotify lets an app play for only five people, so CDPlayer plays through your own free Spotify developer app. It takes two minutes, once. You need Spotify Premium.'));
   if (step === 1) {
     return page(...heading, intro, gap(6),
-      hint(t('Open the dashboard, click Create app, and fill it in — click each to copy it:')),
+      hint(onPhone() ? t('Open the dashboard, tap Create app, and fill it in — tap each to copy it:') : t('Open the dashboard, click Create app, and fill it in — click each to copy it:')),
       el('div', { class: 'copy-list' },
         el('div', {}, t('App name: '), copyLink(app, 'CDPlayer')),
         el('div', {}, t('App description: '), copyLink(app, t('My CD player'))),
