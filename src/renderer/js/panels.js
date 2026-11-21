@@ -19,7 +19,7 @@ import { levelName, LEVELS } from './quality.js';
 import { catSvg } from './glyphs.js';
 import { qrSvg } from './qr.js';
 import { phoneLine, addressWords, errorWords } from './remote-settings.js';
-import { isBookletOpen, closeBooklet } from './booklet.js';
+import { isBookletOpen, isBookletClosing, closeBooklet } from './booklet.js';
 import { formatLyricsForDisplay } from './lyrics.js';
 import { romanFor, romanOn, needsRoman } from './romanize.js';
 import { cardOrder, priceWords, stillWanted } from './want-list.js';
@@ -88,10 +88,11 @@ export const anyOpen = () => panels.size > 0 || !!menuLayer || isBookletOpen();
 /** The LYRICS panel goes when karaoke takes the window (it would stand over it otherwise). */
 export function closeCardPanel() { if (!isOpen('card')) return false; closePanel('card'); return true; }
 export function closeLyricsPanel() { if (isOpen('lyrics')) closePanel('lyrics'); }
-export function closeTopmost() {
+// (`all`: a phone's tab closing everything, in a loop — a booklet already on its way out is passed over, not "closed" again)
+export function closeTopmost({ all = false } = {}) {
   for (const name of ESC_ORDER) {
     if (name === 'menu') { if (menuLayer) { closeMenu(); return true; } continue; }
-    if (name === 'booklet') { if (isBookletOpen()) { closeBooklet(); return true; } continue; }
+    if (name === 'booklet') { if (isBookletOpen() && !(all && isBookletClosing())) { closeBooklet(); return true; } continue; }
     if (panels.has(name)) { closePanel(name); return true; }
   }
   return false;
@@ -620,6 +621,7 @@ function buildSettings(app) {
 // ---- Drop-down menus (theme picker, EQ presets) ------------------------------------------------------------------
 
 let menuLayer = null;
+export const isMenuOpen = () => !!menuLayer;
 /**
  * A small menu under `anchor` (an element, or where one was); items are { label, swatch (CSS background, optional),
  * current, pick, key (a key's hint, optional), more (optional: ✎ and right-click, given where the item is) } or { divider: true }.
@@ -1981,6 +1983,19 @@ export function showShortcuts() {
 
 // Newest first. Only the entry matching the running version is ever shown.
 const CHANGELOG = [
+  { version: '2.24.2', changes: [
+    '<b>The right lyrics</b>: a song whose real name has a letter like &Oslash; or &eacute; where its file has a plain O or E (lynch.&rsquo;s BL&Oslash;OD) finds its own words, and a song of another artist whose title only shares a word with yours (Brotha Lynch Hung&rsquo;s Blood on da Rug for BLOOD) is never taken instead',
+    '<b>Phone: the shelf scrolls under your finger</b>: a swipe that started on a spine carried it off towards the disc instead, and the album never played. A tap opens its case, as before',
+    '<b>Phone: the queue works</b>: it was dimmed under its own shade, and tapping a song just closed it',
+    '<b>Phone: the tabs close what&rsquo;s open</b>: HISTORY, the &hellip; menu and the panels stayed over the player until Back; HISTORY and &hellip; tapped again close themselves, and HISTORY&rsquo;s tab is lit while it&rsquo;s open',
+    '<b>Phone: the display fits</b>: only the words that are on show (all four didn&rsquo;t fit in Russian), and QUEUE is in your language',
+  ], changesIn: { ru: [
+    '<b>Правильный текст</b>: песня, в настоящем названии которой есть буква вроде &Oslash; или &eacute;, а в файле простая O или E (BL&Oslash;OD группы lynch.), находит свои слова, а песня другого исполнителя, у которой с вашей совпадает лишь слово (Blood on da Rug Brotha Lynch Hung вместо BLOOD), больше не берётся вместо неё',
+    '<b>Телефон: полка листается пальцем</b>: свайп, начатый на корешке, уносил его к диску, и альбом так и не играл. Нажатие открывает коробку, как раньше',
+    '<b>Телефон: очередь работает</b>: она была затемнена собственной тенью, а нажатие на песню просто закрывало её',
+    '<b>Телефон: вкладки закрывают открытое</b>: ИСТОРИЯ, меню &hellip; и панели оставались поверх плеера до кнопки «Назад»; ИСТОРИЯ и &hellip; повторным нажатием закрываются сами, а вкладка ИСТОРИЯ подсвечена, пока открыта',
+    '<b>Телефон: дисплей влезает</b>: только включённые слова (по-русски все четыре не помещались), а ОЧЕРЕДЬ — на вашем языке',
+  ] } },
   { version: '2.24.1', changes: [
     '<b>The search counts your songs again</b>: in 2.24.0 it could say SCANNING YOUR MUSIC FOLDER&hellip; for ever, and SCANNING&hellip; where it meant NO MATCHES. Fixed',
     '<b>YouTube Music covers</b>: a song from an album has the album&rsquo;s own square cover again, where YouTube had no picture at the size asked for; a song kept from before finds it the next time it plays',

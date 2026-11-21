@@ -29,9 +29,12 @@ export function setUpPhoneUi(doc = document) {
       const b = doc.createElement('button');
       b.id = 'phone-queue-button';
       b.className = 'pill';
-      b.textContent = 'QUEUE';
-      b.setAttribute('data-i18n', '');
-      b.addEventListener('click', () => showQueue(doc, !doc.body.classList.contains('phone-queue')));
+      b.textContent = globalThis.cdp?.i18nDict?.().dict?.QUEUE || 'QUEUE'; // (made after the page was translated)
+      b.addEventListener('click', () => {
+        const on = !doc.body.classList.contains('phone-queue');
+        if (on && doc.getElementById('shelf-button')?.classList.contains('on')) doc.getElementById('shelf-button').click(); // (the shelf would stand over the sheet)
+        showQueue(doc, on);
+      });
       nav.append(b);
       continue;
     }
@@ -39,6 +42,11 @@ export function setUpPhoneUi(doc = document) {
     if (b) nav.append(b);
   }
   doc.body.append(nav);
+  // Another tab takes the queue sheet away (the panels it stood over go too: app.js).
+  nav.addEventListener('click', (e) => {
+    const tab = e.target.closest('button');
+    if (tab && tab.id !== 'phone-queue-button') showQueue(doc, false);
+  }, true);
   // A new version's pill: up beside SETTINGS (the header's west side, with the desktop's CD buttons, isn't shown here).
   const update = doc.getElementById('update-button'), east = doc.getElementById('header-east');
   if (update && east) east.prepend(update);
@@ -49,7 +57,9 @@ export function setUpPhoneUi(doc = document) {
   const handle = doc.createElement('div');
   handle.id = 'phone-sheet-handle';
   pullToClose(handle, doc.getElementById('queue-card'), () => showQueue(doc, false));
-  doc.body.append(scrim, handle);
+  // (beside the sheet: in the player's own stacking, which stands below anything put on the body)
+  const sheet = doc.getElementById('queue-card');
+  if (sheet) sheet.before(scrim, handle); else doc.body.append(scrim, handle);
   gatherShelfButtons(doc);
   // SHELF in the bar lit while the shelf is open.
   const shelf = doc.getElementById('shelf'), shelfTab = doc.getElementById('shelf-button');

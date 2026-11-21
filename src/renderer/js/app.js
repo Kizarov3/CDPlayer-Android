@@ -3298,6 +3298,15 @@ function buildStaticUi() {
   $('spotify-button').addEventListener('click', () => panels.showSpotify(app));
   setupShelf(app);
   $('history-button').addEventListener('click', () => panels.showHistory(app));
+  // A phone's tab bar (src/android/ui/phone-ui.js) stays over the panels: a tab first closes what's open (HISTORY's
+  // own tab, open, just closes it; so does … with its menu out). HISTORY's tab is lit while it's open.
+  document.addEventListener('click', (e) => {
+    const tab = onAPhone() && e.target.closest && e.target.closest('#phone-nav button');
+    if (!tab) return;
+    const own = (tab.id === 'history-button' && panels.isOpen('history')) || (tab.id === 'more-button' && panels.isMenuOpen());
+    for (let i = 0; i < 50 && panels.closeTopmost({ all: true }); i++) { /* every one (and never for ever) */ }
+    if (own) e.stopImmediatePropagation();
+  }, true);
   $('settings-button').addEventListener('click', () => panels.showSettings(app));
   $('phone-tag').addEventListener('click', () => panels.showSettings(app));
   $('cd-view-button').addEventListener('click', toggleCdView);
@@ -3986,6 +3995,10 @@ async function start() {
   state.skipped = new Set(await cdp.skips.list().catch(() => []));
   state.version = saved.version; state.platform = saved.platform;
   document.body.dataset.platform = saved.platform;
+  if (onAPhone()) { // (a phone's HISTORY tab, lit while it's open)
+    const lit = () => $('history-button').classList.toggle('on', panels.isOpen('history'));
+    new MutationObserver(lit).observe($('overlays'), { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+  }
   state.history = saved.history;
   state.customPresets = saved.eqPresets;
   const s = saved.settings;

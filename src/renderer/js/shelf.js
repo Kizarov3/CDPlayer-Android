@@ -526,6 +526,8 @@ async function fillColors(shown) {
 const DRAG_START_PX = 6;
 function pressSpine(e, spine) {
   if (e.button !== 0 || shelf.caseOpen) return;
+  // (a phone: a finger on a spine is scrolling the shelf, or a tap that opens the case — never carrying it off)
+  if (e.pointerType === 'touch' && document.body.dataset.platform === 'android') return;
   const start = { x: e.clientX, y: e.clientY };
   let drag = null;
   shelf.dragged = false;

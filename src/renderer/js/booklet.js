@@ -18,6 +18,7 @@ const layer = () => document.getElementById('overlays');
 let book = null; // the open booklet: { root, spread, leaves, turned, from, app, content, lyricsTimer, closing }
 
 export const isBookletOpen = () => !!book;
+export const isBookletClosing = () => !!(book && book.closing);
 const discHeading = (n) => t('DISC {n}', { n }); // (the tracklist's rows are `t` where it's used)
 const wait = (ms) => new Promise((r) => setTimeout(r, anim.enabled ? ms : 0));
 

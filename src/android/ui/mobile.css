@@ -43,6 +43,7 @@ html.android #volume-row { display: none; }
 html.android #progress-row { margin-top: 6px; height: 20px; padding: 14px 0; box-sizing: content-box; touch-action: none; }
 /* The deck display's flags: smaller, so PLAY and REPEAT both fit. */
 html.android .vfd-flags { gap: 6px; font-size: 9px; letter-spacing: .04em; }
+html.android .vfd-flags > .vfd-flag:not(.lit), html.android #deck-display > .vfd-flag[data-flag="net"]:not(.lit) { display: none; } /* (only what's on: all four didn't fit, in Russian) */
 
 /* Pressed: something gives under the finger (there's no hover on a phone). */
 html.android .pill:active, html.android .round:active { transform: scale(.96); }
