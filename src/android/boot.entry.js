@@ -63,6 +63,10 @@ installMediaSession(registerPlugin('Playback'));
 // the page is there.
 document.documentElement.classList.add('android');
 const phone = registerPlugin('Phone');
+// A booklet's scans: fetched, shrunk and kept by the phone's own code, and shown from its files.
+const { scanIo } = require('../main/online.js');
+scanIo.save = (url, path, long) => phone.fetchScan({ url, path, long });
+scanIo.address = (p) => globalThis.Capacitor.convertFileSrc(`file://${p}`);
 cdp.toBackground = () => { phone.background().catch(() => {}); };
 // OUTPUT: Android's own picker, and the name of where it plays now ('' — the phone's speaker)
 // MINI MODE: a small window over other apps (picture-in-picture) when the app's left while it plays — kept on this phone

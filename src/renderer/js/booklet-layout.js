@@ -29,6 +29,14 @@ export function leavesFor(front, inside, back, blank) {
   return leaves;
 }
 
+/**
+ * Of `count` leaves with `turned` of them turned over, the ones worth keeping in the page ({ from, to }, inclusive): the
+ * two that are seen, and the one each way that a turn — on or back — would show.
+ */
+export function nearLeaves(turned, count) {
+  return { from: Math.max(0, turned - 2), to: Math.min(count - 1, turned + 1) };
+}
+
 const L = ['0001101', '0011001', '0010011', '0111101', '0100011', '0110001', '0101111', '0111011', '0110111', '0001011'];
 const G = ['0100111', '0110011', '0011011', '0100001', '0011101', '0111001', '0000101', '0010001', '0001001', '0010111'];
 const R = L.map((code) => [...code].map((b) => (b === '1' ? '0' : '1')).join(''));

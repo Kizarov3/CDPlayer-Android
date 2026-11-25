@@ -17,6 +17,7 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.net.Uri;
@@ -318,6 +319,77 @@ public class PhonePlugin extends Plugin {
                 call.resolve(ok);
                 thread.quitSafely();
             }, new Handler(thread.getLooper()));
+        });
+    }
+
+    // ---- A booklet's scans (online.js scanIo) ----
+
+    private static final int SCAN_MAX_BYTES = 40 * 1024 * 1024;
+    private final java.util.concurrent.ExecutorService scans = java.util.concurrent.Executors.newFixedThreadPool(3);
+
+    /**
+     * A scan from the Cover Art Archive (`url`) into the app's booklet-scans folder (`path`), its longer side at most
+     * `long` px, as a JPEG: fetched, decoded and written on a thread of its own. → { width, height }
+     */
+    @PluginMethod public void fetchScan(PluginCall call) {
+        String url = call.getString("url", ""), path = call.getString("path", "");
+        int most = Math.max(200, Math.min(4000, call.getInt("long", 1600)));
+        scans.execute(() -> {
+            HttpURLConnection c = null;
+            File part = null;
+            try {
+                String host = new URL(url).getHost();
+                if (!url.startsWith("https://") || !host.matches("(?:[a-z0-9-]+\\.)*(?:coverartarchive|archive)\\.org")) throw new IOException("not the Cover Art Archive");
+                File file = new File(path).getCanonicalFile();
+                if (!file.getPath().startsWith(NativeFs.canonicalFilesDir(getContext()) + "/cdplayer/booklet-scans/") || !file.getName().endsWith(".jpg")) throw new IOException("not a scan's place");
+                c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(20000);
+                c.setReadTimeout(60000);
+                c.setRequestProperty("User-Agent", "CDPlayer");
+                if (c.getResponseCode() != 200) throw new IOException("HTTP " + c.getResponseCode());
+                ByteArrayOutputStream got = new ByteArrayOutputStream(1 << 19);
+                try (InputStream in = c.getInputStream()) {
+                    byte[] buf = new byte[65536];
+                    for (int n; (n = in.read(buf)) > 0; ) {
+                        got.write(buf, 0, n);
+                        if (got.size() > SCAN_MAX_BYTES) throw new IOException("too big");
+                    }
+                }
+                byte[] bytes = got.toByteArray();
+                BitmapFactory.Options o = new BitmapFactory.Options();
+                o.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.length, o);
+                int w = o.outWidth, h = o.outHeight;
+                if (w <= 0 || h <= 0) throw new IOException("not a picture");
+                part = new File(file.getPath() + ".part");
+                try (OutputStream out = new FileOutputStream(part)) {
+                    if (Math.max(w, h) <= most && "image/jpeg".equals(o.outMimeType)) out.write(bytes); // (as it is)
+                    else {
+                        double k = Math.min(1, most / (double) Math.max(w, h));
+                        int tw = Math.max(1, (int) Math.round(w * k)), th = Math.max(1, (int) Math.round(h * k)), sample = 1;
+                        while (w / (sample * 2) >= tw && h / (sample * 2) >= th) sample *= 2;
+                        BitmapFactory.Options d = new BitmapFactory.Options();
+                        d.inSampleSize = sample;
+                        Bitmap bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, d);
+                        if (bmp == null) throw new IOException("not a picture");
+                        Bitmap scaled = Bitmap.createScaledBitmap(bmp, tw, th, true);
+                        if (scaled != bmp) bmp.recycle();
+                        scaled.compress(Bitmap.CompressFormat.JPEG, 88, out);
+                        scaled.recycle();
+                        w = tw; h = th;
+                    }
+                }
+                if (!part.renameTo(file)) throw new IOException("couldn't keep it");
+                JSObject ok = new JSObject();
+                ok.put("width", w);
+                ok.put("height", h);
+                call.resolve(ok);
+            } catch (Throwable e) { // (out of memory on a huge one too)
+                if (part != null) part.delete();
+                call.reject(String.valueOf(e.getMessage()));
+            } finally {
+                if (c != null) c.disconnect();
+            }
         });
     }
 

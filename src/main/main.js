@@ -710,22 +710,27 @@ handle('online:bookletScans', (q) => {
 });
 async function scansFor(q, name) {
   const dir = path.join(scansDir(), name), list = path.join(dir, 'scans.json'), none = path.join(scansDir(), `${name}.none`);
-  const read = (s) => ({ ...s, art: `data:image/jpeg;base64,${fs.readFileSync(path.join(dir, s.file)).toString('base64')}` });
-  try { return JSON.parse(fs.readFileSync(list, 'utf8')).map(read); } catch {}
+  const { save, address } = online.scanIo;
+  const read = (s) => ({ ...s, art: address ? address(path.join(dir, s.file)) : `data:image/jpeg;base64,${fs.readFileSync(path.join(dir, s.file)).toString('base64')}` });
+  const keep = save && (async (url, i, long) => {
+    fs.mkdirSync(dir, { recursive: true });
+    return { file: `${i}.jpg`, ...await save(url, path.join(dir, `${i}.jpg`), long) };
+  });
+  try { const had = JSON.parse(fs.readFileSync(list, 'utf8')); if (!address || had.every((s) => fs.existsSync(path.join(dir, s.file)))) return had.map(read); } catch {}
   if (fs.existsSync(none) && Date.now() - fs.statSync(none).mtimeMs < 30 * 86400000) return [];
   let scans;
-  try { scans = await online.findBookletScans(q); } catch { return null; } // (offline: looked for another time)
+  try { scans = await online.findBookletScans(q, keep); } catch { return null; } // (offline: looked for another time)
   fs.mkdirSync(scansDir(), { recursive: true });
   if (!scans.length) { fs.writeFileSync(none, ''); return []; }
   fs.mkdirSync(dir, { recursive: true });
-  const kept = scans.map((s, i) => {
+  const kept = keep ? scans : scans.map((s, i) => {
     const file = `${i}.jpg`;
     fs.writeFileSync(path.join(dir, file), Buffer.from(s.art.split(',')[1], 'base64'));
     return { file, kind: s.kind, width: s.width, height: s.height };
   });
   fs.writeFileSync(list, JSON.stringify(kept)); // (last: a half-written folder isn't taken for a whole one)
   fs.rmSync(none, { force: true });
-  return scans;
+  return keep ? kept.map(read) : scans;
 }
 handle('online:lyrics', (details) => (shotsDir ? null : online.findLyrics(details))); // (the screenshots' run is offline: the test song's own lyrics)
 handle('spotify:classify', (text) => spotify.classifySpotifyLink(text));

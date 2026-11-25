@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { paginate, leavesFor, ean13 } from '../src/renderer/js/booklet-layout.js';
+import { paginate, leavesFor, nearLeaves, ean13 } from '../src/renderer/js/booklet-layout.js';
 
 test('pages fill up to what fits, then continue on the next page', () => {
   const fits = (onPage) => onPage.reduce((h, n) => h + n, 0) <= 10; // items are heights
@@ -26,4 +26,17 @@ test('EAN-13 and UPC-A barcodes; invalid ones print nothing', () => {
   assert.strictEqual(ean13('400638133393').digits, '4006381333931'); // check digit added
   assert.strictEqual(ean13('4006381333932'), null);
   assert.strictEqual(ean13('not a barcode'), null);
+});
+
+test('the leaves kept in the page: the two seen, and the next one either way', () => {
+  assert.deepStrictEqual(nearLeaves(0, 23), { from: 0, to: 1 });
+  assert.deepStrictEqual(nearLeaves(1, 23), { from: 0, to: 2 });
+  assert.deepStrictEqual(nearLeaves(10, 23), { from: 8, to: 11 });
+  assert.deepStrictEqual(nearLeaves(23, 23), { from: 21, to: 22 }); // read to its back cover
+  assert.deepStrictEqual(nearLeaves(0, 1), { from: 0, to: 0 });
+  // Whichever way it's turned, the leaf that moves and those it uncovers were there already.
+  for (let t = 0; t <= 8; t++) {
+    const { from, to } = nearLeaves(t, 8);
+    for (const i of [t - 2, t - 1, t, t + 1]) if (i >= 0 && i < 8) assert.ok(i >= from && i <= to, `${t}: ${i}`);
+  }
 });

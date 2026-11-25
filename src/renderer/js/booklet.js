@@ -7,7 +7,7 @@
 import { el, anim, smooth, pathFrames } from './widgets.js';
 import { deriveAutoTheme, rgb } from './theme.js';
 import { parseLrc, formatLyricsForDisplay, currentLineIndex } from './lyrics.js';
-import { paginate, leavesFor, ean13 } from './booklet-layout.js';
+import { paginate, leavesFor, nearLeaves, ean13 } from './booklet-layout.js';
 import { albumCredits, albumSummary, albumSmallPrint, sameAlbum, ownerMarks, storyChunks, releasedLine, formatReleased, penHidden } from './booklet-content.js';
 import { hiddenName } from './hidden-track.js';
 import { withDiscHeads } from './box-set.js';
@@ -53,7 +53,7 @@ export async function openBooklet(app, from, content = null, lid = null) {
     el('button', { class: 'pill', title: t('Put the booklet back (Esc)'), onClick: () => closeBooklet() }, t('CLOSE')));
   bar.style.top = `${Math.round((window.innerHeight + size) / 2) + 12}px`;
   root.append(bar);
-  book = { root, spread, leaves: [], turned: 0, side: 'right', from, app, content, where, back, forward, lid, openedAt: performance.now() };
+  book = { root, spread, leaves: [], laid: new Map(), turning: 0, lifting: true, stale: false, refreshTimer: null, turned: 0, side: 'right', from, app, content, where, back, forward, lid, openedAt: performance.now() };
   buildLeaves();
   stack();
 
@@ -106,7 +106,10 @@ export async function openBooklet(app, from, content = null, lid = null) {
   }
   else await wait(LIFT_MS);
   if (lid && !(from && anim.enabled) && lid.out) lid.out();
-  if (book && book.spread === spread && book.turned === 0) step(1);
+  if (!book || book.spread !== spread) return;
+  book.lifting = false;
+  if (book.turned === 0) step(1);
+  later(); // (what came while it was lifted out)
 }
 
 const LID_MS = 950, LID_BACK_MS = 720; // (put away quicker than it's taken out)
@@ -141,17 +144,20 @@ function onKey(e) {
 
 function turn(direction) {
   if (!book || book.closing) return;
-  const { leaves } = book;
+  const { leaves } = book, b = book;
+  const settle = () => { b.turning--; if (book === b) { stack(); later(); } }; // (swung over)
   if (direction > 0 && book.turned < leaves.length) {
     const leaf = leaves[book.turned++];
+    book.turning++; showNear();
     leaf.style.zIndex = String(leaves.length * 3); // on top of both stacks while it swings over
     leaf.classList.add('turned');
-    setTimeout(stack, anim.enabled ? TURN_MS : 0);
+    setTimeout(settle, anim.enabled ? TURN_MS : 0);
   } else if (direction < 0 && book.turned > 0) {
     const leaf = leaves[--book.turned];
+    book.turning++; showNear();
     leaf.style.zIndex = String(leaves.length * 3);
     leaf.classList.remove('turned');
-    setTimeout(stack, anim.enabled ? TURN_MS : 0);
+    setTimeout(settle, anim.enabled ? TURN_MS : 0);
   } // (back at the front cover it stays: CLOSE, Esc or a click outside puts it away)
 }
 
@@ -159,9 +165,25 @@ function turn(direction) {
 function stack() {
   if (!book) return;
   book.leaves.forEach((leaf, i) => { leaf.style.zIndex = String(i < book.turned ? i + 1 : book.leaves.length * 2 - i); });
+  showNear();
   // The front cover on its own, then the spreads inside counted from 1 (the booklet opens at the first of them).
   book.where.textContent = book.turned ? t('{n} OF {total}', { n: book.turned, total: book.leaves.length }) : t('COVER');
   book.back.disabled = book.turned === 0; book.forward.disabled = book.turned >= book.leaves.length; // (nothing that way)
+}
+
+// A phone: each leaf is layers for the GPU to hold and draw, scans and all, and most lie hidden under others — only
+// those that can be seen are kept in the page (see nearLeaves): turned to, they're put in as the turn starts, and the
+// rest taken out once no leaf is still swinging. Scans are decoded as they come near, not in the middle of a turn.
+function showNear() {
+  if (!book || !onPhone()) return;
+  const b = book, near = nearLeaves(b.turned, b.leaves.length);
+  b.leaves.forEach((leaf, i) => {
+    const on = i >= near.from && i <= near.to;
+    if (on && leaf.hidden) {
+      leaf.hidden = false;
+      leaf.querySelectorAll('img').forEach((img) => img.decode().catch(() => {}));
+    } else if (!on && !leaf.hidden && !b.turning && !b.closing) leaf.hidden = true;
+  });
 }
 
 /** Closes the booklet back into the case (and the art back into the corner). */
@@ -172,6 +194,8 @@ export async function closeBooklet() {
   window.removeEventListener('keydown', onKey, true);
   clearInterval(b.lyricsTimer);
   if (b.turned > 0) {
+    view('right'); // (a phone: the cover it's shut to is on the right, off the screen from a left-hand page)
+    if (b.leaves[0].hidden) { b.leaves[0].hidden = false; void b.leaves[0].offsetWidth; } // (the cover, shut over the rest)
     b.leaves.forEach((leaf) => leaf.classList.remove('turned'));
     b.turned = 0;
     await wait(TURN_MS * 0.6);
@@ -204,11 +228,27 @@ export async function closeBooklet() {
   b.content.onClose();
 }
 
-/** An album booklet whose content changed (more lyrics found): its pages again, open at the page being read. */
+/**
+ * An album booklet whose content changed (more lyrics found): its pages again, open at the page being read. Not while
+ * it's being lifted out or a page turns (a movement would stutter), and what comes together is put in together.
+ */
 export function refreshBooklet(content) {
   if (!book || book.closing || book.content !== content) return;
+  book.stale = true;
+  later();
+}
+const REFRESH_MS = 250;
+function later() {
+  const b = book;
+  if (!b || !b.stale || b.refreshTimer || b.lifting || b.turning) return; // (asked again as the movement ends)
+  b.refreshTimer = setTimeout(() => {
+    b.refreshTimer = null;
+    if (book === b && b.stale && !b.closing && !b.lifting && !b.turning) rebuild();
+  }, REFRESH_MS);
+}
+function rebuild() {
+  book.stale = false;
   const key = readingKey();
-  book.leaves.forEach((leaf) => leaf.remove());
   buildLeaves();
   const found = spreadWith(key);
   const turned = found >= 0 ? found : Math.min(book.turned, book.leaves.length);
@@ -217,11 +257,11 @@ export function refreshBooklet(content) {
   book.leaves.forEach((leaf, i) => {
     leaf.style.transition = 'none';
     leaf.classList.toggle('turned', i < turned);
-    void leaf.offsetWidth;
-    leaf.style.transition = '';
   });
-  book.lastLine = -2; // the new pages get the line being sung highlighted again
   stack();
+  void book.spread.offsetWidth; // (once, for all of them)
+  book.leaves.forEach((leaf) => { leaf.style.transition = ''; });
+  book.lastLine = -2; // the new pages get the line being sung highlighted again
 }
 
 // The page being read: the one the reader last turned to (the left page of the spread, or the right one at the front
@@ -246,16 +286,31 @@ function spreadWith(key) {
 // After a rebuild the reader is still on the page they turned to, even though it may now be the right-hand page.
 function keepReading(turned, key) { book.reading = { turned, key }; }
 
+// The leaves for the content as it is. Pages laid out before are the same elements (book.laid), and a leaf with the same
+// two pages as before stays as it is, so a song's words coming in cost only their own pages.
 function buildLeaves() {
   const { spread, content } = book;
-  const size = spread.offsetHeight;
-  book.leaves = leavesFor(frontCover(content), insidePages(content, spread, size), backCover(content), blankPage)
-    .map((pages, i) => {
-      const leaf = el('div', { class: 'leaf' }, face(pages.front, 'front'), face(pages.back, 'back'));
-      leaf.dataset.index = i;
-      spread.append(leaf);
-      return leaf;
-    });
+  const size = spread.offsetHeight, was = book.leaves;
+  const pages = leavesFor(once('cover', null, () => frontCover(content)), insidePages(content, spread, size), once('back', null, () => backCover(content)), blankPage);
+  book.leaves = pages.map((p, i) => {
+    const old = was[i];
+    if (old && old.pages.front === p.front && old.pages.back === p.back) return old;
+    const leaf = el('div', { class: 'leaf' }, face(p.front, 'front'), face(p.back, 'back'));
+    leaf.dataset.index = i;
+    leaf.pages = p;
+    leaf.hidden = onPhone(); // (shown when it's near: showNear)
+    return leaf;
+  });
+  was.forEach((leaf) => { if (!book.leaves.includes(leaf)) leaf.remove(); });
+  spread.append(...book.leaves.filter((leaf) => leaf.parentNode !== spread));
+}
+// What `make` gives, made once for this `key` while what it's made from (`from`) is the same.
+function once(key, from, make) {
+  const had = book.laid.get(key);
+  if (had && had.from === from) return had.made;
+  const made = make();
+  book.laid.set(key, { from, made });
+  return made;
 }
 
 // ---- Pages ---------------------------------------------------------------------------------------------------------
@@ -273,8 +328,9 @@ function view(side) {
   book.side = side;
   const size = pageSize();
   // (with the lift out of the case, which may still be going, kept as it was)
-  book.spread.style.transition = anim.enabled ? `transform ${LIFT_MS}ms cubic-bezier(.2,.7,.2,1), left 260ms cubic-bezier(.2,.7,.2,1)` : 'none';
-  book.spread.style.left = `${side === 'left' ? 8 : 8 - size}px`;
+  // (slid by `translate`, which the GPU moves: `left` would lay out and paint every page anew each frame)
+  book.spread.style.transition = anim.enabled ? `transform ${LIFT_MS}ms cubic-bezier(.2,.7,.2,1), translate 260ms cubic-bezier(.2,.7,.2,1)` : 'none';
+  book.spread.style.translate = side === 'left' ? `${size}px 0` : '0 0';
 }
 function step(direction) {
   if (!book || book.closing) return;
@@ -492,20 +548,26 @@ function insidePages(content, spread, size) {
   const sizer = el('div', { class: 'page measuring' });
   Object.assign(sizer.style, { width: `${size}px`, height: `${size}px` });
   spread.append(sizer);
-  // Fills pages with rows while they fit, measuring each in an invisible page of the same size. Each page is keyed
-  // (section and page number), so a booklet built again can open at the same page.
-  const layout = (key, head, rows) => paginate(rows, (onPage) => {
-    sizer.replaceChildren(head(), el('div', { class: 'page-body' }, onPage.map((r) => r())));
-    return sizer.scrollHeight <= sizer.clientHeight;
-  }).map((onPage, n) => {
-    const page = el('div', { class: 'page' }, head(n), el('div', { class: 'page-body' }, onPage.map((r) => r())));
-    page.dataset.key = `${key}:${n}`;
-    return page;
+  // Fills pages with rows while they fit, measuring each in an invisible page of the same size (a row more at a time).
+  // Each page is keyed (section and page number), so a booklet built again can open at the same page. `from`: what the
+  // section's made from — the same as last time, its pages are too.
+  const layout = (key, from, head, rows) => once(key, from, () => {
+    let body = null, on = [];
+    return paginate(rows, (onPage) => {
+      if (body && onPage.length === on.length + 1 && onPage[0] === on[0]) body.append(onPage[onPage.length - 1]());
+      else { body = el('div', { class: 'page-body' }, onPage.map((r) => r())); sizer.replaceChildren(head(), body); }
+      on = onPage;
+      return sizer.scrollHeight <= sizer.clientHeight;
+    }).map((onPage, n) => {
+      const page = el('div', { class: 'page' }, head(n), el('div', { class: 'page-body' }, onPage.map((r) => r())));
+      page.dataset.key = `${key}:${n}`;
+      return page;
+    });
   });
 
   // Tracklist.
   const { tracks } = content;
-  pages.push(...layout('tracks', (n) => heading(n ? t('{title} (cont.)', { title: tracks.title }) : tracks.title, n ? null : tracks.sub), tracks.rows.map((t, k) => () => {
+  pages.push(...layout('tracks', tracks, (n) => heading(n ? t('{title} (cont.)', { title: tracks.title }) : tracks.title, n ? null : tracks.sub), tracks.rows.map((t, k) => () => {
     if (t.disc) return el('div', { class: 'disc-head' }, discHeading(t.disc)); // a set's next disc
     if (t.pen) { // a hidden song written in under its track: no number, no time, a little crooked
       return el('div', { class: 'track hidden-pen' }, el('span', { class: 'no' }), el('span', { class: 'name' }, el('span', { class: 'pen', style: `display: inline-block; transform: rotate(${((k * 37) % 5) - 2}deg)` }, `+ ${t.name}`)));
@@ -531,7 +593,7 @@ function insidePages(content, spread, size) {
       t('From Wikipedia: “{title}” · CC BY-SA', { title: story.title })));
     // A single's (or an EP's) article is mostly about its song: the page says what the release is.
     const about = story.kind === 'Single' ? t('ABOUT THE SINGLE') : story.kind === 'EP' ? t('ABOUT THE EP') : t('ABOUT THE ALBUM');
-    pages.push(...layout('story', (n) => heading(n ? t('{title} (cont.)', { title: about }) : about, n ? null : releasedLine(story.released, { locale })), rows));
+    pages.push(...layout('story', story, (n) => heading(n ? t('{title} (cont.)', { title: about }) : about, n ? null : releasedLine(story.released, { locale })), rows));
   };
   if (!content.storyLate) addStory();
 
@@ -543,8 +605,8 @@ function insidePages(content, spread, size) {
       const scanPage = (key, half) => { const p = el('div', { class: `page scan${half ? ` half ${half}` : ''}` }, img()); p.dataset.key = key; return p; };
       if (scan.width / scan.height > 1.6) {
         if (pages.length % 2) { const b = blankPage(); b.dataset.key = `scan:${i}:blank`; pages.push(b); }
-        pages.push(scanPage(`scan:${i}`, 'left'), scanPage(`scan:${i}:r`, 'right'));
-      } else pages.push(scanPage(`scan:${i}`));
+        pages.push(once(`scan:${i}`, scan, () => scanPage(`scan:${i}`, 'left')), once(`scan:${i}:r`, scan, () => scanPage(`scan:${i}:r`, 'right')));
+      } else pages.push(once(`scan:${i}`, scan, () => scanPage(`scan:${i}`)));
     });
   };
   if (!content.scansLate) addScans();
@@ -553,7 +615,7 @@ function insidePages(content, spread, size) {
   for (const song of content.lyrics) {
     const synced = parseLrc(song.raw);
     const lines = synced.length ? synced.map((l, i) => ({ text: l.text, i })) : formatLyricsForDisplay(song.raw).split('\n').map((text) => ({ text }));
-    pages.push(...layout(song.key, (n) => heading(n ? t('{title} (cont.)', { title: song.title }) : song.title, n ? null : song.sub), lines.map((l) => () => {
+    pages.push(...layout(song.key, JSON.stringify([song.title, song.sub, song.raw, song.live]), (n) => heading(n ? t('{title} (cont.)', { title: song.title }) : song.title, n ? null : song.sub), lines.map((l) => () => {
       const line = el('div', { class: `lyric${l.text ? '' : ' gap'}` }, l.text || ' ');
       if (l.i != null && song.live) line.dataset.line = l.i;
       return line;
@@ -563,11 +625,13 @@ function insidePages(content, spread, size) {
   // Credits, and this disc or album.
   const { credits } = content;
   const dl = (list) => el('dl', { class: 'credits' }, list.flatMap(([k, v]) => [el('dt', {}, k), el('dd', {}, String(v))]));
-  const page = el('div', { class: 'page' }, heading(t('CREDITS'), credits.sub), el('div', { class: 'page-body' },
-    credits.rows.length ? dl(credits.rows) : el('div', { class: 'none' }, credits.none),
-    el('div', { class: 'page-title small' }, credits.summaryTitle), dl(credits.summary)));
-  page.dataset.key = 'credits:0';
-  pages.push(page);
+  pages.push(once('credits', credits, () => {
+    const page = el('div', { class: 'page' }, heading(t('CREDITS'), credits.sub), el('div', { class: 'page-body' },
+      credits.rows.length ? dl(credits.rows) : el('div', { class: 'none' }, credits.none),
+      el('div', { class: 'page-title small' }, credits.summaryTitle), dl(credits.summary)));
+    page.dataset.key = 'credits:0';
+    return page;
+  }));
   if (content.storyLate) addStory();
   if (content.scansLate) addScans();
 

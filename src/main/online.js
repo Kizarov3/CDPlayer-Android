@@ -349,12 +349,16 @@ async function findDiscArt({ artist, album, releaseId, found = null }) {
   if (failed) throw new Error('disc art: lookup failed');
   return null;
 }
+const SCAN_LONG = 1600; // a scan's longer side, px (an original can be 5000: past this a page looks no sharper)
+// The phone's (boot.entry.js): save(url, file, long) → { width, height }, and a kept scan's address for the page. With
+// them a booklet of scans never passes through the page as base64 — megabytes of it, each read and decoded in turn.
+const scanIo = { save: null, address: null };
 /**
  * The real booklet's pages, the back of the case and what's under the disc, as scanned for the Cover Art Archive
  * (booklet-scans.js picks the release and the scans). → [{ art (data URL), kind, width, height }], [] when nobody has
  * scanned them; throws when a lookup failed (offline), so it's looked for another time.
  */
-async function findBookletScans({ artist, album, releaseId }) {
+async function findBookletScans({ artist, album, releaseId }, keep = null) {
   const scans = require('./booklet-scans');
   let group = artist && album ? await releaseGroupNamed(artist, album) : null;
   const bare = bareAlbum(album);
@@ -369,13 +373,17 @@ async function findBookletScans({ artist, album, releaseId }) {
   }));
   const picks = scans.bestScans(found, releaseId || null);
   if (!picks.length && failed) throw new Error('booklet scans: lookup failed');
-  const got = await Promise.all(picks.map(async (p) => {
+  const got = await Promise.all(picks.map(async (p, i) => {
+    if (keep) { // (the phone: its own code fetches, shrinks and keeps a scan, away from the page's thread)
+      const kept = await keep(secureArchiveUrl(p.url), i, SCAN_LONG).catch(() => null);
+      if (!kept) failed = true;
+      return kept && { ...kept, kind: p.kind };
+    }
     let art = await fetchImageDataUrl(p.url, 60000).catch(() => null);
     if (!art) { failed = true; return null; }
     let img = nativeImage.createFromDataURL(art);
-    const LONG = 1600; // (an original can be 5000 px: past this a page looks no sharper)
-    if (Math.max(img.getSize().width, img.getSize().height) > LONG) {
-      img = img.getSize().width >= img.getSize().height ? img.resize({ width: LONG, quality: 'best' }) : img.resize({ height: LONG, quality: 'best' });
+    if (Math.max(img.getSize().width, img.getSize().height) > SCAN_LONG) {
+      img = img.getSize().width >= img.getSize().height ? img.resize({ width: SCAN_LONG, quality: 'best' }) : img.resize({ height: SCAN_LONG, quality: 'best' });
       art = `data:image/jpeg;base64,${img.toJPEG(88).toString('base64')}`;
     }
     const { width, height } = img.getSize();
@@ -597,4 +605,4 @@ async function findLyrics({ title, artist, album, duration, guessed }) {
   return null;
 }
 
-module.exports = { bareAlbum, shorterTitles, findDiscArt, findBookletScans, fetchJson, musicBrainzAlbum, sameSong, hiddenNameFrom, findHiddenName, findCover, findCoverUrl, findAlbumCover, findAlbumCoverUrl, findLyrics, lookupTags, pickRecording, coverFromUrl, mbFetch, wordOverlapRatio, secureArchiveUrl, sameLyricsSong };
+module.exports = { scanIo, bareAlbum, shorterTitles, findDiscArt, findBookletScans, fetchJson, musicBrainzAlbum, sameSong, hiddenNameFrom, findHiddenName, findCover, findCoverUrl, findAlbumCover, findAlbumCoverUrl, findLyrics, lookupTags, pickRecording, coverFromUrl, mbFetch, wordOverlapRatio, secureArchiveUrl, sameLyricsSong };
