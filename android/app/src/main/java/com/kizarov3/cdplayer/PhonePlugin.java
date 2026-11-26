@@ -645,6 +645,7 @@ public class PhonePlugin extends Plugin {
                 }
                 synchronized (PhonePlugin.class) { spotifyServer = server; }
                 server.setSoTimeout(180000);
+                SignInService.start(getContext()); // (else, in the background behind the browser, the app is frozen and never answers it)
                 getActivity().runOnUiThread(() -> getActivity().startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))));
                 while (true) {
                     java.net.Socket s = server.accept(); // (its timing out is the 3 minutes)
@@ -664,7 +665,9 @@ public class PhonePlugin extends Plugin {
             } catch (Exception e) {
                 call.reject(server != null && server.isClosed() ? "another sign-in started" : String.valueOf(e.getMessage()));
             } finally {
-                synchronized (PhonePlugin.class) { if (spotifyServer == server) spotifyServer = null; }
+                boolean last;
+                synchronized (PhonePlugin.class) { last = spotifyServer == server; if (last) spotifyServer = null; }
+                if (last) SignInService.stop(getContext()); // (not when another sign-in has taken over: it still waits)
                 if (server != null) try { server.close(); } catch (IOException ignored) { }
             }
         }).start();

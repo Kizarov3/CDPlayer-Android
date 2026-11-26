@@ -1,0 +1,6 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="signin_channel">Вход в Spotify</string>
+    <string name="signin_title">Ждём вход в Spotify</string>
+    <string name="signin_text">Войдите в браузере и вернитесь в CDPlayer</string>
+</resources>

@@ -52,6 +52,12 @@
             </intent-filter>
         </service>
 
+        <!-- awake while Spotify's sign-in page is open in the browser (SignInService) -->
+        <service
+            android:name=".SignInService"
+            android:exported="false"
+            android:foregroundServiceType="shortService" />
+
         <receiver android:name="androidx.media.session.MediaButtonReceiver" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MEDIA_BUTTON" />

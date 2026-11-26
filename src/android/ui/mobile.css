@@ -48,6 +48,7 @@ html.android .vfd-flags > .vfd-flag:not(.lit), html.android #deck-display > .vfd
 /* Pressed: something gives under the finger (there's no hover on a phone). */
 html.android .pill:active, html.android .round:active { transform: scale(.96); }
 html.android * { touch-action: manipulation; }
+html.android #disc { touch-action: none; } /* the disc turned by a finger (disc.js grab): the browser took the drag for a scroll that isn't there, and cancelled it */
 
 /* The queue: off the page, a sheet over the player when QUEUE in the bar is tapped — a handle to pull it down by,
    the player dimmed behind it (a tap there closes it). */

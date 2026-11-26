@@ -25,7 +25,10 @@ const MARKER_FONT = '"Marker Felt", "Segoe Print", "Bradley Hand", "Comic Sans M
 // A real disc, as fractions of its radius: the clear plastic around the hole, the mirror band around that (where the
 // stamped matrix number sits), and the printed label from there out to the rim.
 const CLEAR_R = 0.27, LABEL_R = 0.36;
+// The phone draws a steadily turning disc on layers (frame(), showLayers): its GPU is the battery's.
+const layers = () => document.body.dataset.platform === 'android';
 const WEAR_MIN_SIDE = 150; // too small to see (Mini Mode): no wear drawn
+const shineAlpha = (strength) => 0.22 + 0.2 * strength; // how strongly the shine's drawn over the disc
 const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
 const discBoxes = new WeakMap();
 /**
@@ -336,14 +339,15 @@ export class Disc {
    * spins. Rendered once per size on its own canvas, facing the light at angle 0 (so the fans can fade out toward the
    * hub and the rim), then turned to wherever the light is: the whole pattern just rotates with it.
    */
-  drawShine(g, cx, cy, side, dpr) {
+  drawShine(g, cx, cy, side, dpr, onLayer = false) {
     const px = Math.max(1, Math.round(side * dpr));
     if (!this.shine || this.shine.width !== px) { this.shine = new OffscreenCanvas(px, px); this.renderShine(px); }
-    const { angle, strength } = this.light;
+    // (on its layer: facing angle 0 at full strength — the layer is turned to the light and faded to its strength)
+    const angle = onLayer ? 0 : this.light.angle;
     g.save();
     g.beginPath(); g.arc(cx, cy, side / 2, 0, Math.PI * 2); g.clip();
     g.globalCompositeOperation = 'screen';
-    g.globalAlpha *= 0.22 + 0.2 * strength;
+    if (!onLayer) g.globalAlpha *= shineAlpha(this.light.strength);
     g.translate(cx, cy); g.rotate(angle);
     g.drawImage(this.shine, -side / 2, -side / 2, side, side);
     g.restore();
@@ -699,6 +703,44 @@ export class Disc {
     if (this.label.artist) write(this.label.artist, c + c * 0.6, side / 15, 0.04);
   }
 
+  // A steadily turning disc's layers over the canvas (frame()): the face, turned by the compositor; the shine, blended
+  // as drawShine blends it (screen); the cover's thumbnail and the ⟲ on top. Canvases beside it in its column, the same
+  // size and place — so what styles.css does to the column's canvases (hidden under ALBUM's cover, CASE's side) is
+  // done to them too. Cleared and drawn when what they show changes; between, only the face layer's turn.
+  showLayers(pw, ph, dpr, r, cx, cy) {
+    if (!this.layerEls) {
+      this.layerEls = ['face', 'shine', 'top'].map((kind) => {
+        const c = document.createElement('canvas');
+        c.className = `disc-layer ${kind}`;
+        c.setAttribute('aria-hidden', 'true');
+        return c;
+      });
+      this.canvas.after(...this.layerEls);
+    }
+    const [face, shine, top] = this.layerEls.map((c) => {
+      if (c.width !== pw || c.height !== ph) { c.width = pw; c.height = ph; }
+      c.hidden = false;
+      const g = c.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, r.width, r.height);
+      return g;
+    });
+    this.layerEls[0].style.transformOrigin = this.layerEls[1].style.transformOrigin = `${cx}px ${cy}px`;
+    this.layerTurn = this.layerLight = this.layerFade = null;
+    return { face, shine, top };
+  }
+  hideLayers() {
+    if (this.layerEls && !this.layerEls[0].hidden) for (const c of this.layerEls) c.hidden = true;
+    return null;
+  }
+  turnLayer() {
+    const [face, shine] = this.layerEls, turn = this.angle % (Math.PI * 2);
+    if (turn !== this.layerTurn) { this.layerTurn = turn; face.style.transform = `rotate(${turn}rad)`; }
+    const light = this.shineOn ? `rotate(${(this.light.angle % (Math.PI * 2)).toFixed(4)}rad)` : '', fade = this.shineOn ? shineAlpha(this.light.strength).toFixed(3) : '';
+    if (light !== this.layerLight) { this.layerLight = light; shine.style.transform = light; }
+    if (fade !== this.layerFade) { this.layerFade = fade; shine.style.opacity = fade; }
+  }
+
   /** Returns the drawn disc's bounds (CSS px, relative to the canvas) — used to keep theme particles off it. */
   frame(now, dt) {
     const cnv = this.canvas, dpr = window.devicePixelRatio || 1;
@@ -717,7 +759,7 @@ export class Disc {
     // Not on screen (a PLAYER LOOK without the disc), or not to be drawn (`offstage`: ALBUM's, hidden under its cover):
     // it still turns and its tray still runs — E waits on the tray — but nothing is drawn.
     const r = this.offstage ? null : cnv.getBoundingClientRect();
-    if (!r || !r.width || !r.height) { this.lastLook = null; return null; }
+    if (!r || !r.width || !r.height) { this.lastLook = null; this.hideLayers(); return null; }
     const pw = Math.round(r.width * dpr), ph = Math.round(r.height * dpr);
     if (cnv.width !== pw || cnv.height !== ph) { cnv.width = pw; cnv.height = ph; }
 
@@ -747,15 +789,27 @@ export class Disc {
     // Nothing that shows has changed since the last frame (a paused disc, the light at rest): leave the canvas be —
     // redrawing it 60 times a second anyway kept the GPU busy for nothing.
     const l = this.light;
-    const look = [pw, ph, side, x, y, this.angle, this.speed, this.shineOn && l.angle, this.shineOn && l.strength, tray, art, eject, wobble, this.mode,
+    // Turning steadily with nothing else moving (the phone: layers()): the face is drawn once on a layer of its own and
+    // turned by the compositor — a canvas redrawn sixty times a second (the case, the shine, the cover in its corner
+    // with it) was most of what playing cost. Anything else moving, or a worn disc's scratches catching the light (they
+    // move against the light), or BLUE's ring: drawn whole, as before.
+    const steady = layers() && !mini && !(tray > 0) && art === 0 && !(eject > 0) && !wobble && this.flipT === 0 && this.speed >= 0.999
+      && !this.fling && !this.jogging && !this.held && !this.morph && !this.coverHide && this.discPresent && !this.inCase && this.theme !== 'BLUE'
+      && !(this.shineOn && this.wear && side >= WEAR_MIN_SIDE);
+    // (the full art over it: the disc isn't seen — faded out under it — so its turning isn't either)
+    const unseen = art >= 1, still = steady || unseen;
+    const look = [pw, ph, side, x, y, still ? 'not drawn turning' : this.angle, still ? 1 : this.speed, // (steady: up to speed — still creeping towards 1 each frame)
+      !still && this.shineOn && l.angle, !still && this.shineOn && l.strength, tray, // (steady: the shine's layer is turned and faded) art, eject, wobble, this.mode,
       this.faceKey, this.coverVersion, this.lookingUp, this.label && this.label.title, this.label && this.label.artist, JSON.stringify(this.print), this.discArtVersion,
       this.discPresent, this.inCase, this.coverInCase, colors.accent, colors.accent2, colors.bg, dpr, this.flipT, this.data && this.data.key, this.theme, shown.light,
       this.flipT > 0 && this.data && this.position ? Math.round(radiusAt(this.data.layout, this.position()) * 2000) : 0].join('|');
-    if (look === this.lastLook) return bounds;
+    if (look === this.lastLook) { if (steady) this.turnLayer(); return bounds; }
     this.lastLook = look;
+    const L = steady ? this.showLayers(pw, ph, dpr, r, cx, cy) : this.hideLayers();
     const g = cnv.getContext('2d');
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, r.width, r.height);
+    const gt = L ? L.top : g; // (the cover's thumbnail and the ⟲: over the disc)
     let drawArt = null;
     // A light theme (white plastic round it): the case, the tray and the shadows light and soft, never black; the disc
     // itself as it is.
@@ -787,19 +841,19 @@ export class Disc {
         const size = thumb + (full - thumb) * art;
         drawArt = (cover) => {
           const x = caseX + 14, y = caseY + 14;
-          g.fillStyle = light ? 'rgba(0,0,0,0.1)' : 'rgba(0,0,0,0.47)';
-          g.beginPath(); g.roundRect(x, y, size, size, 3 + 3 * art); g.fill();
+          gt.fillStyle = light ? 'rgba(0,0,0,0.1)' : 'rgba(0,0,0,0.47)';
+          gt.beginPath(); gt.roundRect(x, y, size, size, 3 + 3 * art); gt.fill();
           const inner = size - 6;
           if (inner > 0) {
             const iw = cover.naturalWidth, ih = cover.naturalHeight, s = Math.min(iw, ih);
-            g.save();
-            g.beginPath(); g.roundRect(x + 3, y + 3, inner, inner, 1.5 + 3 * art); g.clip();
-            g.imageSmoothingQuality = 'high';
-            g.drawImage(cover, (iw - s) / 2, (ih - s) / 2, s, s, x + 3, y + 3, inner, inner);
-            g.restore();
+            gt.save();
+            gt.beginPath(); gt.roundRect(x + 3, y + 3, inner, inner, 1.5 + 3 * art); gt.clip();
+            gt.imageSmoothingQuality = 'high';
+            gt.drawImage(cover, (iw - s) / 2, (ih - s) / 2, s, s, x + 3, y + 3, inner, inner);
+            gt.restore();
           }
-          g.strokeStyle = rgb(colors.accent2); g.lineWidth = 1.2;
-          g.beginPath(); g.roundRect(x + 2, y + 2, size - 4, size - 4, 2.5 + 3 * art); g.stroke();
+          gt.strokeStyle = rgb(colors.accent2); gt.lineWidth = 1.2;
+          gt.beginPath(); gt.roundRect(x + 2, y + 2, size - 4, size - 4, 2.5 + 3 * art); gt.stroke();
         };
       }
     }
@@ -857,12 +911,13 @@ export class Disc {
     }
     if (this.theme === 'BLUE' && !mini && this.speed > 0.01) this.drawRing(g, cx, cy, side, dpr);
     const face = dataSide ? this.renderDataFace(side, dpr) : this.renderFace(side, dpr);
-    g.save();
-    g.translate(cx, cy); g.rotate(this.angle); g.translate(-cx, -cy);
-    g.imageSmoothingQuality = 'high';
-    g.drawImage(face.canvas, x, y, side, side);
-    g.restore();
-    if (this.shineOn) this.drawShine(g, cx, cy, side, dpr);
+    const gf = L ? L.face : g;
+    gf.save();
+    gf.translate(cx, cy); gf.rotate(L ? 0 : this.angle); gf.translate(-cx, -cy); // (on its layer: unturned, the layer turns)
+    gf.imageSmoothingQuality = 'high';
+    gf.drawImage(face.canvas, x, y, side, side);
+    gf.restore();
+    if (this.shineOn) this.drawShine(L ? L.shine : g, cx, cy, side, dpr, !!L);
     if (this.shineOn && this.wear && side >= WEAR_MIN_SIDE && !dataSide) this.drawGlint(g, cx, cy, side, dpr);
     if (dataSide) this.drawLaser(g, cx, cy, side);
     if (this.speed < 0.99) { // a stopped disc sits a little darker, brightening as it gets up to speed
@@ -871,21 +926,22 @@ export class Disc {
     }
     g.restore();
     if (drawArt && tray < 1 && !this.coverInCase) { // the case's cover thumbnail steps aside while the tray is out
-      g.save(); g.globalAlpha = (1 - reveal) * (1 - (this.coverHide || 0)); drawArt(this.cover); g.restore();
+      gt.save(); gt.globalAlpha = (1 - reveal) * (1 - (this.coverHide || 0)); drawArt(this.cover); gt.restore();
     }
     // The ⟲ in the case's corner that turns the disc over.
     this.flipRect = null;
     if (!mini && this.data && !(tray > 0) && !(art > 0)) {
       const cs = side + 60, r = 11, bx = cx + cs / 2 - 22, by = cy + cs / 2 - 22;
       this.flipRect = { x: bx, y: by, r };
-      g.save();
-      if (light) { g.fillStyle = 'rgba(255,255,255,0.92)'; g.strokeStyle = 'rgba(0,0,0,0.14)'; } else { g.fillStyle = 'rgba(0,0,0,0.45)'; g.strokeStyle = 'rgba(255,255,255,0.22)'; }
-      g.lineWidth = 1.2;
-      g.beginPath(); g.arc(bx, by, r, 0, Math.PI * 2); g.fill(); g.stroke();
-      g.fillStyle = rgb(colors.accent2); g.font = `bold 13px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
-      g.fillText('⟲', bx, by + 1);
-      g.restore();
+      gt.save();
+      if (light) { gt.fillStyle = 'rgba(255,255,255,0.92)'; gt.strokeStyle = 'rgba(0,0,0,0.14)'; } else { gt.fillStyle = 'rgba(0,0,0,0.45)'; gt.strokeStyle = 'rgba(255,255,255,0.22)'; }
+      gt.lineWidth = 1.2;
+      gt.beginPath(); gt.arc(bx, by, r, 0, Math.PI * 2); gt.fill(); gt.stroke();
+      gt.fillStyle = rgb(colors.accent2); gt.font = `bold 13px ${FONT}`; gt.textAlign = 'center'; gt.textBaseline = 'middle';
+      gt.fillText('⟲', bx, by + 1);
+      gt.restore();
     }
+    if (steady) this.turnLayer();
     return bounds;
   }
 

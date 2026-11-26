@@ -117,18 +117,43 @@ test('playlists: the old and the renamed track count both read', async () => {
   ], next: null });
 });
 
-test('search asks for at most 10 albums and playlists (the development-mode limit)', async () => {
+test('search asks for at most 10 songs, albums and playlists (the development-mode limit): songs first', async () => {
   connected();
   answer({ ...TOKEN, 'https://api.spotify.com/v1/search': { body: {
+    tracks: { items: [{ id: 't1', uri: 'spotify:track:t1', name: 'Idioteque', artists: [{ name: 'Radiohead' }], duration_ms: 309000, album: { id: 'a1', name: 'Kid A' } }, null] },
     albums: { items: [{ id: 'a1', name: 'Kid A', artists: [{ name: 'Radiohead' }], total_tracks: 10 }] },
     playlists: { items: [null, { id: 'p1', name: 'Kid A deep cuts', owner: { display_name: 'x' }, items: { total: 4 } }] },
   } } });
   const r = await spotify.search('kid a');
-  assert.deepStrictEqual(r.items.map((i) => `${i.kind}:${i.id}`), ['album:a1', 'playlist:p1']);
+  assert.deepStrictEqual(r.items.map((i) => `${i.kind}:${i.id}`), ['track:t1', 'album:a1', 'playlist:p1']);
+  assert.deepStrictEqual(r.items[0], { kind: 'track', id: 't1', uri: 'spotify:track:t1', name: 'Idioteque', owner: 'Radiohead', durationMs: 309000, albumId: 'a1', albumName: 'Kid A' });
   const u = new URL(requests[1].url);
   assert.strictEqual(u.searchParams.get('q'), 'kid a');
-  assert.strictEqual(u.searchParams.get('type'), 'album,playlist');
+  assert.strictEqual(u.searchParams.get('type'), 'track,album,playlist');
   assert.strictEqual(u.searchParams.get('limit'), '10');
+});
+
+test('a song picked from a search: its album goes on the tray, starting from that song', async () => {
+  connected();
+  answer({ ...TOKEN, 'https://api.spotify.com/v1/albums/a1': { body: {
+    name: 'Kid A', artists: [{ name: 'Radiohead' }], images: [img(640, 'L')],
+    tracks: { items: [{ uri: 'spotify:track:t0', name: 'Everything', duration_ms: 1 }, { uri: 'spotify:track:t1', name: 'Idioteque', duration_ms: 2 }], next: null },
+  } } });
+  const r = await spotify.discTracks({ kind: 'track', id: 't1', uri: 'spotify:track:t1', albumId: 'a1' });
+  assert.deepStrictEqual(r.tracks.map((t) => t.uri), ['spotify:track:t0', 'spotify:track:t1']);
+  assert.strictEqual(r.start, 1);
+  assert.strictEqual(r.name, 'Kid A');
+});
+
+test("a song whose album can't be read (or isn't on it): the song alone", async () => {
+  connected();
+  answer({ ...TOKEN,
+    'https://api.spotify.com/v1/albums/a9': { status: 404, body: {} },
+    'https://api.spotify.com/v1/tracks/t1': { body: { uri: 'spotify:track:t1', name: 'Single', duration_ms: 5, artists: [{ name: 'X' }], album: { name: 'S', artists: [{ name: 'X' }], images: [img(300, 'c')] } } },
+  });
+  const r = await spotify.discTracks({ kind: 'track', id: 't1', uri: 'spotify:track:t1', albumId: 'a9' });
+  assert.deepStrictEqual(r.tracks.map((t) => [t.uri, t.title, t.artist, t.cover]), [['spotify:track:t1', 'Single', 'X', 'c']]);
+  assert.strictEqual(r.start, 0);
 });
 
 test('an album becomes disc tracks, with its biggest cover, across pages of tracks', async () => {
@@ -143,9 +168,9 @@ test('an album becomes disc tracks, with its biggest cover, across pages of trac
   });
   const r = await spotify.discTracks({ kind: 'album', id: 'a1' });
   assert.deepStrictEqual(r.tracks, [
-    { uri: 'spotify:track:t1', title: 'One', artist: 'A', album: 'Alb', durationMs: 1000, cover: 'L' },
-    { uri: 'spotify:track:t2', title: 'Two', artist: 'A', album: 'Alb', durationMs: 2000, cover: 'L' },
-    { uri: 'spotify:track:t3', title: 'Three', artist: 'B', album: 'Alb', durationMs: 3000, cover: 'L' },
+    { uri: 'spotify:track:t1', title: 'One', artist: 'A', album: 'Alb', durationMs: 1000, cover: 'L', credits: { albumArtist: 'A' } },
+    { uri: 'spotify:track:t2', title: 'Two', artist: 'A', album: 'Alb', durationMs: 2000, cover: 'L', credits: { albumArtist: 'A' } },
+    { uri: 'spotify:track:t3', title: 'Three', artist: 'B', album: 'Alb', durationMs: 3000, cover: 'L', credits: { albumArtist: 'A' } },
   ]);
 });
 
@@ -164,6 +189,20 @@ test('a grandfathered app: /items is missing, so /tracks is read instead', async
   connected();
   answer({ ...TOKEN, 'https://api.spotify.com/v1/playlists/p1/tracks': { body: { items: [{ track: { type: 'track', uri: 'spotify:track:t1', name: 'One', duration_ms: 1, artists: [], album: { name: 'Al', images: [] } } }], next: null } } });
   assert.deepStrictEqual((await spotify.discTracks({ kind: 'playlist', id: 'p1' })).tracks.map((t) => t.uri), ['spotify:track:t1']);
+});
+
+test('what Spotify says of an album comes with its songs, for the booklet: date, label, small print, barcode, places', async () => {
+  connected();
+  answer({ ...TOKEN, 'https://api.spotify.com/v1/albums/a1': { body: {
+    name: 'Alb', artists: [{ name: 'A' }], images: [], release_date: '1998-08-18', label: 'Immortal', genres: [],
+    copyrights: [{ text: '1998 Immortal', type: 'C' }, { text: '(P) 1998 Epic', type: 'P' }], external_ids: { upc: '074646900123' },
+    tracks: { items: [{ uri: 'spotify:track:t1', name: 'One', duration_ms: 1, artists: [{ name: 'A' }], track_number: 1, disc_number: 1 },
+      { uri: 'spotify:track:t2', name: 'Two', duration_ms: 1, artists: [{ name: 'A' }], track_number: 1, disc_number: 2 }], next: null },
+  } } });
+  const { tracks } = await spotify.discTracks({ kind: 'album', id: 'a1' });
+  const album = { albumArtist: 'A', released: '1998-08-18', label: 'Immortal', copyright: '© 1998 Immortal · ℗ 1998 Epic', barcode: '074646900123' };
+  assert.deepStrictEqual(tracks[0].credits, { ...album, track: { no: 1, of: null } });
+  assert.deepStrictEqual(tracks[1].credits, { ...album, track: { no: 1, of: null }, disc: { no: 2, of: null } });
 });
 
 test("a followed playlist: Spotify withholds its songs, and that's said rather than an empty disc", async () => {
@@ -310,4 +349,99 @@ test('what went wrong, and which step of the setup fixes it', () => {
   assert.strictEqual(spotify.diagnose('NO_PREMIUM').step, 4);
   assert.strictEqual(spotify.diagnose('NO_ANSWER').step, 1); // the browser never came back: most often the Redirect URI
   for (const code of ['BAD_KEYS', 'NOT_REGISTERED', 'NO_PREMIUM', 'NO_ANSWER']) assert.ok(spotify.diagnose(code).text.length > 20);
+});
+
+test('new scopes (likes, recently played) are asked for at sign-in, but a sign-in without them still plays', () => {
+  for (const s of ['user-library-modify', 'user-read-recently-played', 'user-read-playback-state']) assert.ok(spotify.SCOPES.includes(s), s);
+  write(['id', 'secret', 'refresh', spotify.SCOPES.filter((s) => s !== 'user-library-modify' && s !== 'user-read-recently-played').join(' ')]);
+  assert.deepStrictEqual(spotify.status(), { configured: true, connected: true, reconnectNeeded: false, missing: ['user-library-modify', 'user-read-recently-played'] });
+});
+
+test('the shelf: every saved album, its songs as tracks of an album, its cover and when it was saved', async () => {
+  connected();
+  answer({ ...TOKEN, 'https://api.spotify.com/v1/me/albums': (url) => ({ body: url.includes('offset=0') ? {
+    items: [{ added_at: '2026-11-01T10:00:00Z', album: { id: 'a1', name: 'OK Computer', artists: [{ name: 'Radiohead' }], release_date: '1997-05-21', images: [img(640, 'L')], total_tracks: 2,
+      tracks: { items: [{ uri: 'spotify:track:t1', name: 'Airbag', duration_ms: 284000, track_number: 1, disc_number: 1, artists: [{ name: 'Radiohead' }] }, { uri: 'spotify:track:t2', name: 'Paranoid Android', duration_ms: 383000, track_number: 2, disc_number: 1, artists: [{ name: 'Radiohead' }] }], next: null } } }],
+    next: 'https://api.spotify.com/v1/me/albums?offset=50&limit=50' } : { items: [{ added_at: '2026-10-01T10:00:00Z', album: { id: 'a2', name: 'Kid A', artists: [{ name: 'Radiohead' }], release_date: '2000', images: [], total_tracks: 10 } }], next: null } }) });
+  const r = await spotify.libraryAlbums();
+  assert.strictEqual(r.albums.length, 2);
+  assert.deepStrictEqual(r.albums[0], {
+    id: 'spotify:album:a1', spotify: { id: 'a1', cover: 'L', total: 2 }, title: 'OK Computer', artist: 'Radiohead', year: 1997, released: '1997-05-21',
+    discs: 1, duration: 667, added: Date.parse('2026-11-01T10:00:00Z'), arrived: Date.parse('2026-11-01T10:00:00Z'),
+    tracks: [{ path: 'spotify:track:t1', title: 'Airbag', artist: 'Radiohead', duration: 284, track: 1, disc: 1 }, { path: 'spotify:track:t2', title: 'Paranoid Android', artist: 'Radiohead', duration: 383, track: 2, disc: 1 }],
+  });
+  assert.deepStrictEqual(r.albums[1].tracks, [], 'an album whose songs Spotify left out: they come when it is played');
+  assert.strictEqual(r.albums[1].year, 2000);
+});
+
+test('Liked Songs as a disc, and what was played lately as albums to put in again', async () => {
+  connected();
+  answer({ ...TOKEN,
+    'https://api.spotify.com/v1/me/tracks': { body: { items: [{ track: { uri: 'spotify:track:t9', name: 'Song', duration_ms: 1000, artists: [{ name: 'X' }], album: { name: 'Al', images: [img(300, 'c')] } } }, { track: null }], next: null } },
+    'https://api.spotify.com/v1/me/player/recently-played': { body: { items: [
+      { track: { album: { id: 'a1', name: 'OK Computer', artists: [{ name: 'Radiohead' }], total_tracks: 12 } } },
+      { track: { album: { id: 'a1', name: 'OK Computer', artists: [{ name: 'Radiohead' }], total_tracks: 12 } } },
+      { track: { album: { id: 'a2', name: 'Kid A', artists: [{ name: 'Radiohead' }], total_tracks: 10 } } }] } },
+  });
+  const liked = await spotify.discTracks({ kind: 'liked' });
+  assert.deepStrictEqual(liked.tracks.map((x) => [x.uri, x.album, x.cover]), [['spotify:track:t9', 'Al', 'c']]);
+  assert.deepStrictEqual((await spotify.recentAlbums()).items.map((i) => i.id), ['a1', 'a2']);
+});
+
+test('likes: which are saved, asked 40 at a time; saving and taking out by their spotify: links', async () => {
+  connected();
+  answer({ ...TOKEN,
+    'https://api.spotify.com/v1/me/library/contains': (url) => ({ body: new URL(url).searchParams.get('uris').split(',').map((u, i) => i % 2 === 0) }),
+    'https://api.spotify.com/v1/me/library': { status: 200 },
+  });
+  const uris = Array.from({ length: 45 }, (_, i) => `spotify:track:t${i}`);
+  const saved = await spotify.savedIn(uris);
+  assert.strictEqual(saved.saved.length, 45);
+  assert.deepStrictEqual(saved.saved.slice(38, 42), [true, false, true, false]);
+  assert.strictEqual(requests.filter((r) => r.url.includes('/contains')).length, 2);
+  assert.deepStrictEqual(await spotify.setSaved(['spotify:album:a1'], true), { ok: true });
+  const put = requests.at(-1);
+  assert.strictEqual(put.init.method, 'PUT');
+  assert.match(put.url, /\/me\/library\?uris=spotify%3Aalbum%3Aa1$/);
+  await spotify.setSaved(['spotify:track:t1'], false);
+  assert.strictEqual(requests.at(-1).init.method, 'DELETE');
+});
+
+test('a sign-in from before likes could be saved: said so, not as a sign-out', async () => {
+  connected();
+  answer({ ...TOKEN, 'https://api.spotify.com/v1/me/library': { status: 403, body: { error: { status: 403, message: 'Insufficient client scope' } } } });
+  assert.deepStrictEqual(await spotify.setSaved(['spotify:track:t1'], true), { error: 'SCOPE' });
+});
+
+test('the phone: what plays where, the devices, moving the music to one, and its buttons', async () => {
+  connected();
+  answer({ ...TOKEN,
+    'https://api.spotify.com/v1/me/player/devices': { body: { devices: [{ id: 'd1', name: 'iPhone', type: 'Smartphone', is_active: true, volume_percent: 50 }, { id: null, name: 'Restricted' }] } },
+    'https://api.spotify.com/v1/me/player/next': { status: 204 },
+    'https://api.spotify.com/v1/me/player/seek': { status: 204 },
+    'https://api.spotify.com/v1/me/player?': { status: 204 },
+    'https://api.spotify.com/v1/me/player': (url, init) => (init.method === 'PUT' ? { status: 204 } : { body: { is_playing: true, progress_ms: 61000, device: { id: 'd1', name: 'iPhone', type: 'Smartphone', volume_percent: 50 },
+      item: { uri: 'spotify:track:t1', name: 'Airbag', duration_ms: 284000, artists: [{ name: 'Radiohead' }], album: { name: 'OK Computer', images: [img(640, 'L')] } } } }),
+  });
+  assert.deepStrictEqual(await spotify.playerState(), { playing: true, positionMs: 61000, device: { id: 'd1', name: 'iPhone', type: 'Smartphone', volume: 50 },
+    track: { uri: 'spotify:track:t1', title: 'Airbag', artist: 'Radiohead', album: 'OK Computer', durationMs: 284000, cover: 'L' } });
+  assert.deepStrictEqual(await spotify.devices(), { devices: [{ id: 'd1', name: 'iPhone', type: 'Smartphone', active: true, volume: 50 }] });
+  assert.deepStrictEqual(await spotify.transfer({ deviceId: 'd1', play: true }), { ok: true });
+  assert.deepStrictEqual(JSON.parse(requests.at(-1).init.body), { device_ids: ['d1'], play: true });
+  assert.deepStrictEqual(await spotify.remote({ command: 'next' }), { ok: true });
+  assert.strictEqual(requests.at(-1).init.method, 'POST');
+  await spotify.remote({ command: 'seek', ms: 1234.4 });
+  assert.match(requests.at(-1).url, /seek\?position_ms=1234$/);
+  answer({ ...TOKEN, 'https://api.spotify.com/v1/me/player': { status: 204 } });
+  assert.strictEqual(await spotify.playerState(), null, 'nothing playing anywhere');
+});
+
+test("songs known only by their links: what each is, asked one by one, those Spotify doesn't have left out", async () => {
+  connected();
+  answer({ ...TOKEN,
+    'https://api.spotify.com/v1/tracks/t1': { body: { uri: 'spotify:track:t1', name: 'Cold Open', duration_ms: 133000, artists: [{ name: '照井順政' }], track_number: 1, album: { name: 'JJK OST', images: [img(640, 'L')] } } },
+    'https://api.spotify.com/v1/tracks/t2': { status: 404, body: {} },
+  });
+  const r = await spotify.tracksInfo(['spotify:track:t1', 'spotify:track:t2']);
+  assert.deepStrictEqual(r.tracks.map((x) => [x.uri, x.title, x.artist, x.album, x.durationMs, x.cover]), [['spotify:track:t1', 'Cold Open', '照井順政', 'JJK OST', 133000, 'L']]);
 });

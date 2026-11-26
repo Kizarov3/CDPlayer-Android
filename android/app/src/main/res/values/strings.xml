@@ -4,4 +4,7 @@
     <string name="title_activity_main">CDPlayer</string>
     <string name="package_name">com.kizarov3.cdplayer</string>
     <string name="custom_url_scheme">com.kizarov3.cdplayer</string>
+    <string name="signin_channel">Spotify sign-in</string>
+    <string name="signin_title">Waiting for Spotify</string>
+    <string name="signin_text">Sign in in the browser, then come back to CDPlayer</string>
 </resources>

@@ -47,6 +47,9 @@ export function swingLid(node, to, { base = '', onCross = () => {}, onShut = () 
 /** A spring, as Apple's animations move: settling by the end of the animation, past its mark a little first while
  *  `damping` is under 1 (0.8: about 2%). → a CSS linear() easing. */
 export function spring(damping) {
+  // (a WebView older than Chrome 113 — Android's own, never updated — has no linear(): animate() would throw, and the
+  // panel not open. A curve that goes a touch past instead, or none past.)
+  if (typeof CSS !== 'undefined' && CSS.supports && !CSS.supports('animation-timing-function', 'linear(0, 1)')) return damping < 1 ? 'cubic-bezier(.2, 1.25, .4, 1)' : 'cubic-bezier(.4, 0, .2, 1)';
   const w = 6.2 / damping, wd = w * Math.sqrt(1 - damping * damping), points = [];
   for (let i = 0; i <= 48; i++) {
     const t = i / 48;
